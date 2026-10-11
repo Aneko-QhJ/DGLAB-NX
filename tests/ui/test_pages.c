@@ -91,7 +91,7 @@ static void logPoll(Service* s) { assert(s == &service); }
 static void bleLogPoll(Service* s) { assert(s == &service); }
 static void buildLogPointers(DglabLogRing* ring) { for (int i = 0; i < ring->filled; ++i) ring->pointers[i] = ring->lines[i]; }
 static void logPushLine(DglabLogRing* ring, const char* value) {
-    if (ring->filled < DGLAB_SCREEN_LOG_LINES) snprintf(ring->lines[ring->filled++], DGLAB_SCREEN_LOG_LINE_LEN, "%s", value);
+    if (ring->filled < DGLAB_SCREEN_LOG_LINES) snprintf(ring->lines[ring->filled++], DGLAB_SCREEN_LOG_LINE_LEN, "%.*s", DGLAB_SCREEN_LOG_LINE_LEN - 1, value);
     ++ring->generation;
 }
 static void noteCommand(const char* name, Result rc, const char* note) { (void)name; (void)rc; (void)note; }
