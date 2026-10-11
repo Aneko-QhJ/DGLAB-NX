@@ -150,6 +150,10 @@ static void checkRequestRoundTrip(const char* name, u32 command_id, const void* 
 static void testRequestPayloads(void)
 {
     const DglabPocStartRequest start = { .applet_resource_user_id = 0x0123456789ABCDEFull };
+    const DglabPocStartRequest short_start = {
+        .flags = DGLAB_POC_START_FLAG_TARGET_ADDRESS | DGLAB_POC_START_FLAG_SHORT_OBSERVATION,
+        .target_address = { 1, 2, 3, 4, 5, 6 },
+    };
     const DglabPocActionRequest action = { .action = DglabPocAction_ProbeBtdrvScan };
     // The console has two actions left, and the round trip pins both numbers: an
     // action number that moves silently breaks a console still running the
@@ -158,6 +162,8 @@ static void testRequestPayloads(void)
     const DglabPocLogRequest log = { .cursor = 0x00001234u };
 
     checkRequestRoundTrip("start", DGLAB_IPC_POC_CMD_START, &start, sizeof(start));
+    checkRequestRoundTrip("start short observation", DGLAB_IPC_POC_CMD_START,
+        &short_start, sizeof(short_start));
     checkRequestRoundTrip("action", DGLAB_IPC_POC_CMD_ACTION, &action, sizeof(action));
     checkRequestRoundTrip("action btm", DGLAB_IPC_POC_CMD_ACTION, &btm_action,
         sizeof(btm_action));

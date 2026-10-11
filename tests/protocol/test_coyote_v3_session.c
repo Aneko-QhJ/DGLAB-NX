@@ -460,6 +460,158 @@ static void testFireAndForgetSession(void)
     CHECK_U8(packet.strength_a.value, 10);
 }
 
+// The formal BLE connection is idle after BF and startup zero, then plays each
+// client batch once. These are transport-independent packet-level regressions.
+static void testOnDemandConnectionAndStrength(void)
+{
+    Recorder recorder = { 0 };
+    DglabCoyoteV3Session session;
+    DglabCoyoteV3SessionConfig config = defaultConfig();
+    config.output_on_demand = true;
+    config.strength_feedback = DglabCoyoteV3StrengthFeedback_None;
+    makeSession(&session, &recorder, &config);
+    dglabCoyoteV3SessionOnConnected(&session);
+    dglabCoyoteV3SessionTick(&session, 1000);
+    expectWriteCount(&recorder, 1); // BF only, no idle B0
+
+    dglabCoyoteV3SessionSetStrengthZero(&session, DglabCoyoteV3ChannelA);
+    dglabCoyoteV3SessionSetStrengthZero(&session, DglabCoyoteV3ChannelB);
+    dglabCoyoteV3SessionTick(&session, 100);
+    DglabCoyoteV3B0 packet = decodeB0Write(&recorder, 1);
+    CHECK_U8(packet.sequence, 0);
+    CHECK(packet.strength_a.mode == DglabCoyoteV3StrengthMode_Absolute);
+    CHECK(packet.strength_b.mode == DglabCoyoteV3StrengthMode_Absolute);
+    for (unsigned i = 0; i < 20; i++)
+        dglabCoyoteV3SessionTick(&session, 100);
+    expectWriteCount(&recorder, 2);
+
+    // A later request works without B1 and does not start waveform playback.
+    dglabCoyoteV3SessionAdjustStrength(&session, DglabCoyoteV3ChannelB, 5);
+    dglabCoyoteV3SessionTick(&session, 100);
+    packet = decodeB0Write(&recorder, 2);
+    CHECK_U8(packet.strength_b.value, 5);
+    CHECK(!dglabCoyoteV3IsChannelWaveformValid(packet.waveform_a));
+    CHECK(!dglabCoyoteV3IsChannelWaveformValid(packet.waveform_b));
+    dglabCoyoteV3SessionTick(&session, 1000);
+    expectWriteCount(&recorder, 3);
+}
+
+static void testOnDemandChannelsFinishIndependently(void)
+{
+    static const DglabCoyoteV3WaveformEntry a[] = {
+        {100, 10}, {100, 20}, {100, 30}, {100, 40}, {200, 50},
+    };
+    static const DglabCoyoteV3WaveformEntry b[] = {{300, 60}};
+    Recorder recorder = { 0 };
+    DglabCoyoteV3Session session;
+    DglabCoyoteV3SessionConfig config = defaultConfig();
+    config.output_on_demand = true;
+    config.strength_feedback = DglabCoyoteV3StrengthFeedback_None;
+    makeSession(&session, &recorder, &config);
+    dglabCoyoteV3SessionOnConnected(&session);
+    CHECK(dglabCoyoteV3SessionSetWaveform(&session, DglabCoyoteV3ChannelA, a, 5));
+    CHECK(dglabCoyoteV3SessionSetWaveform(&session, DglabCoyoteV3ChannelB, b, 1));
+    dglabCoyoteV3SessionTick(&session, 100);
+    DglabCoyoteV3B0 packet = decodeB0Write(&recorder, 1);
+    CHECK_U8(packet.waveform_a[3].strength, 40);
+    CHECK_U8(packet.waveform_b[0].strength, 60);
+    CHECK_U8(packet.waveform_b[1].strength, 0);
+    CHECK(dglabCoyoteV3IsChannelWaveformValid(packet.waveform_b));
+    dglabCoyoteV3SessionTick(&session, 100);
+    packet = decodeB0Write(&recorder, 2);
+    CHECK_U8(packet.waveform_a[0].strength, 50);
+    CHECK_U8(packet.waveform_a[1].strength, 0);
+    CHECK(dglabCoyoteV3IsChannelWaveformValid(packet.waveform_a));
+    CHECK(!dglabCoyoteV3IsChannelWaveformValid(packet.waveform_b));
+    dglabCoyoteV3SessionTick(&session, 1000);
+    expectWriteCount(&recorder, 3);
+
+    // Replacement starts fresh, and clearing A leaves B's batch intact.
+    CHECK(dglabCoyoteV3SessionSetWaveform(&session, DglabCoyoteV3ChannelA, a, 5));
+    CHECK(dglabCoyoteV3SessionSetWaveform(&session, DglabCoyoteV3ChannelB, a, 5));
+    dglabCoyoteV3SessionClearWaveform(&session, DglabCoyoteV3ChannelA);
+    dglabCoyoteV3SessionTick(&session, 100);
+    packet = decodeB0Write(&recorder, 3);
+    CHECK(!dglabCoyoteV3IsChannelWaveformValid(packet.waveform_a));
+    CHECK_U8(packet.waveform_b[0].strength, 10);
+    CHECK(dglabCoyoteV3SessionSetWaveform(&session, DglabCoyoteV3ChannelB, b, 1));
+    dglabCoyoteV3SessionTick(&session, 100);
+    packet = decodeB0Write(&recorder, 4);
+    CHECK_U8(packet.waveform_b[0].strength, 60);
+    dglabCoyoteV3SessionTick(&session, 1000);
+    expectWriteCount(&recorder, 5);
+}
+
+static void testOnDemandTestBatchDoesNotLoop(void)
+{
+    DglabCoyoteV3WaveformEntry entries[48];
+    Recorder recorder = { 0 };
+    DglabCoyoteV3Session session;
+    DglabCoyoteV3SessionConfig config = defaultConfig();
+    config.output_on_demand = true;
+    for (unsigned i = 0; i < 48; i++)
+        entries[i] = (DglabCoyoteV3WaveformEntry){100, 100};
+    makeSession(&session, &recorder, &config);
+    dglabCoyoteV3SessionOnConnected(&session);
+    CHECK(dglabCoyoteV3SessionSetWaveform(&session, DglabCoyoteV3ChannelA, entries, 48));
+    for (unsigned i = 0; i < 12; i++) {
+        dglabCoyoteV3SessionTick(&session, 100);
+        DglabCoyoteV3B0 packet = decodeB0Write(&recorder, i + 1);
+        CHECK_U8(packet.waveform_a[3].strength, 100);
+    }
+    for (unsigned i = 0; i < 20; i++)
+        dglabCoyoteV3SessionTick(&session, 100);
+    expectWriteCount(&recorder, 13);
+}
+
+static void testOnDemandAppendKeepsUnplayedSlots(void)
+{
+    static const DglabCoyoteV3WaveformEntry first[] = {
+        {100, 10}, {100, 20}, {100, 30}, {100, 40}, {100, 50},
+    };
+    static const DglabCoyoteV3WaveformEntry next[] = {{100, 60}, {100, 70}};
+    Recorder recorder = { 0 };
+    DglabCoyoteV3Session session;
+    DglabCoyoteV3SessionConfig config = defaultConfig();
+    config.output_on_demand = true;
+    makeSession(&session, &recorder, &config);
+    dglabCoyoteV3SessionOnConnected(&session);
+    CHECK(dglabCoyoteV3SessionAppendWaveform(&session, DglabCoyoteV3ChannelA, first, 5));
+    dglabCoyoteV3SessionTick(&session, 100);
+    CHECK(dglabCoyoteV3SessionAppendWaveform(&session, DglabCoyoteV3ChannelA, next, 2));
+    CHECK(dglabCoyoteV3SessionAppendWaveform(&session, DglabCoyoteV3ChannelB, next, 1));
+    CHECK(dglabCoyoteV3SessionAppendWaveform(&session, DglabCoyoteV3ChannelB, next + 1, 1));
+    dglabCoyoteV3SessionTick(&session, 100);
+    DglabCoyoteV3B0 packet = decodeB0Write(&recorder, 2);
+    CHECK_U8(packet.waveform_a[0].strength, 50);
+    CHECK_U8(packet.waveform_a[1].strength, 60);
+    CHECK_U8(packet.waveform_a[2].strength, 70);
+    CHECK_U8(packet.waveform_a[3].strength, 0);
+    CHECK_U8(packet.waveform_b[0].strength, 60);
+    CHECK_U8(packet.waveform_b[1].strength, 70);
+    dglabCoyoteV3SessionTick(&session, 1000);
+    expectWriteCount(&recorder, 3);
+
+    // Capacity and validation errors preserve the existing queue. Consumed
+    // space becomes available again; it never causes old slots to replay.
+    DglabCoyoteV3WaveformEntry full[DGLAB_COYOTE_V3_WAVEFORM_CAPACITY];
+    for (unsigned i = 0; i < DGLAB_COYOTE_V3_WAVEFORM_CAPACITY; i++)
+        full[i] = (DglabCoyoteV3WaveformEntry){100, 10};
+    CHECK(dglabCoyoteV3SessionAppendWaveform(&session, DglabCoyoteV3ChannelA, full,
+        DGLAB_COYOTE_V3_WAVEFORM_CAPACITY));
+    CHECK(!dglabCoyoteV3SessionAppendWaveform(&session, DglabCoyoteV3ChannelA, next, 1));
+    CHECK(session.waveform_a.count == DGLAB_COYOTE_V3_WAVEFORM_CAPACITY);
+    dglabCoyoteV3SessionTick(&session, 100);
+    CHECK(dglabCoyoteV3SessionAppendWaveform(&session, DglabCoyoteV3ChannelA, next, 2));
+    CHECK(session.waveform_a.count == DGLAB_COYOTE_V3_WAVEFORM_CAPACITY - 2);
+    static const DglabCoyoteV3WaveformEntry invalid[] = {{0, 10}};
+    CHECK(!dglabCoyoteV3SessionAppendWaveform(&session, DglabCoyoteV3ChannelA, invalid, 1));
+    CHECK(!dglabCoyoteV3SessionAppendWaveform(&session, DglabCoyoteV3ChannelA, NULL, 1));
+    CHECK(!dglabCoyoteV3SessionAppendWaveform(&session, DglabCoyoteV3ChannelA, next, 0));
+    CHECK(session.waveform_a.count == DGLAB_COYOTE_V3_WAVEFORM_CAPACITY - 2);
+    CHECK_U8(session.waveform_a.entries[session.waveform_a.count - 1].strength, 70);
+}
+
 int main(void)
 {
     testBfIsWrittenOnEveryConnect();
@@ -473,6 +625,10 @@ int main(void)
     testNotificationsOtherThanB1AreIgnored();
     testDisconnectDropsInFlightStrength();
     testFireAndForgetSession();
+    testOnDemandConnectionAndStrength();
+    testOnDemandChannelsFinishIndependently();
+    testOnDemandTestBatchDoesNotLoop();
+    testOnDemandAppendKeepsUnplayedSlots();
 
     return testFinish();
 }

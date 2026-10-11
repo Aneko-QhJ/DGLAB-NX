@@ -50,11 +50,10 @@ u32 blePocReadLog(u32 cursor, char* out, u32 out_size);
 
 // Starts a session with the two channel strength ceilings from the request
 // (0..200 each; 0 means that channel cannot output anything). The worker thread
-// runs the usual bring-up - the caller has to have run the driver-level probe in
-// an earlier session of this boot, see docs/ble-poc.md - then connects,
-// subscribes and streams until stopped. The session also plays its own waveform,
-// which is what puts the device into its "outputting" state (and lights its
-// light) even while both strengths are 0.
+// requires the caller to finish the driver-level probe first, in the same
+// startup sequence (docs/ble-poc.md), then connects through btm. It
+// subscribes, initializes limits and zeros strengths. It keeps the connection
+// until stopped, writing B0 only for client waveform or strength requests.
 Result blePocSessionStart(const DglabBleStartRequest* request);
 
 // Requests a stop; the worker caps the device and disconnects on its own.
@@ -68,12 +67,14 @@ void blePocSessionGetStatus(DglabBleStatus* out);
 // gameplay inputs (or the sysmodule can, see main.c).
 bool blePocSessionIsActive(void);
 
-// Queues waveform data for the session (no-op when none is running).
+// Queues one-shot waveform data per channel (no-op when none is running).
+// Append keeps unplayed slots; Replace starts a fresh batch on that channel.
 Result blePocSessionUploadWaveform(const DglabNetWaveformRequest* request);
 
 // Queues a Socket V3 message for the session: `strength-<ch>+<mode>+<value>`
 // is what the gameplay sends (docs/dglab-socket.md), and it is applied to the
-// local session instead of being forwarded to a phone.
+// local session instead of being forwarded to a phone. Clear drops pending and
+// playing waveform data for the selected channels, while keeping the connection.
 Result blePocSessionSend(const DglabNetSendRequest* request);
 
 // Moves the session's channel strength ceilings (0..200 each). The worker writes

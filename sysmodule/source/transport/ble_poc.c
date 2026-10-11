@@ -22,6 +22,7 @@
 // Packet construction uses dglab/protocol/coyote_v3.h; this file only moves
 // bytes and reports what happened through the log ring the NRO reads.
 
+#include <dglab/transport/ble_prepare.h>
 #include <dglab/transport/ble_poc.h>
 
 #include <dglab/protocol/coyote_v3.h>
@@ -33,6 +34,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+
+#ifndef DGLAB_BUILD_STAMP
+#define DGLAB_BUILD_STAMP "unknown"
+#endif
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -112,6 +117,9 @@ typedef struct {
     u64 aruid;
     u32 pending_action;
     bool use_target_address;
+    bool short_observation;
+    bool short_preparation_used; // NRO driver bring-up is one-shot per boot.
+    bool reboot_required; // A connect is still in flight; never reinitialize this boot.
     bool address_discovered; // The driver-level scan already wrote one out.
     bool ble_session_requested; // blePocSessionStart asked for a session.
     u8 target_address[6];
@@ -289,6 +297,14 @@ static void pocSetState(u32 state)
         pocLog("state=%s", pocStateName(state));
 }
 
+static void pocFail(Result rc)
+{
+    mutexLock(&g_poc.mutex);
+    g_poc.status.last_result = (u32)rc;
+    g_poc.status.state = DglabPocState_Failed;
+    mutexUnlock(&g_poc.mutex);
+}
+
 static void pocSetMilestone(u32 bits)
 {
     mutexLock(&g_poc.mutex);
@@ -323,6 +339,26 @@ static void pocBtdrvProbeBond(const BtdrvAddress* addr, const char* label);
 
 // Raw `bt` service read (definition next to the transport): the service returns
 // what libnx's wrappers throw away, and the CCCD experiment above uses it.
+// A GATT request that follows a read right away is answered with
+// Bluetooth/0x153 on this firmware: both write types fail and the packet is
+// dropped without a retry (2026-09-25, the two rounds that added the reads).
+// The periodic B0 writes come back a tick later anyway, but the single-shot
+// packets do not, so every read gets a moment of quiet before the next request.
+static void pocBtmSettle(const char* reason)
+{
+    pocLog("btm transport: settle 300ms %s", reason);
+    svcSleepThread(300000000ull);
+}
+
+// Reading through the `bt` service. libnx's read wrappers (bt.c cmd 0 = read
+// characteristic, cmd 1 = read descriptor) pass no buffer and have no out
+// parameter, so whatever the service returns is dropped on the floor - and the
+// firmware's handlers do build a reply (btdrv's case 0x5a/0x5b copy the
+// attribute value and id into a reply buffer after FUN_00077e70 succeeds). This
+// issues the same CMIF command by hand with an out buffer attached, so the value
+// is finally visible. A CCCD read of 0x0001 would answer the question this
+// project has been stuck on: whether RegisterNotification / the hand-written
+// descriptor write really reached the device.
 static void pocBtRawRead(u32 handle, u32 cmd, const BtdrvGattId* serv,
     const BtdrvGattId* chr, const BtdrvGattId* desc, const char* label);
 
@@ -337,6 +373,7 @@ static void pocSaveDiscoveredAddress(const BtdrvAddress* addr);
 // btm-side helpers the BLE session uses (all defined next to the btm probe).
 static u8 pocBtEventsDrain(const char* label, u32 rounds, u8* out_client_if);
 static bool pocBtmConnectRetry(const char* label, const BtdrvAddress* addr, u32* out_handle);
+static bool pocBtmConnectTry(const char* label, const BtdrvAddress* addr, u32* out_handle);
 static void pocBtmLogGatt(const char* label, u32 handle);
 
 // Defined next to the btm probe, used by the driver-level probe's device dump.
@@ -495,8 +532,9 @@ static u8 g_ble_address[6];
 // strength is what the client dials.
 static u32 g_ble_limit_a;
 static u32 g_ble_limit_b;
-static bool g_ble_waveform_pending;
-static DglabNetWaveformRequest g_ble_waveform;
+static u8 g_ble_waveform_pending; // one bit per channel
+static DglabNetWaveformRequest g_ble_waveform[2];
+static u8 g_ble_clear_pending;
 static PocBleStrengthOp g_ble_strength[POC_BLE_STRENGTH_QUEUE];
 static u32 g_ble_strength_count;
 static bool g_ble_limit_pending;
@@ -618,61 +656,6 @@ static const DglabCoyoteV3WaveformEntry g_poc_btm_wheel_waveform[] = {
     { .frequency_ms = 100u, .strength = 15u },
 };
 
-// What a BLE session plays on both channels from the moment it connects.
-//
-// This is the App's own "output on" in packet form: the App starts streaming its
-// waveform, and the device's light follows that stream - the user's phone test
-// (2026-09-26) shows the light flashing with the channel strength ceiling and the
-// strength both at 0, so the light tracks the waveform, not the amplitude.
-//
-// A session that sends no waveform data is not the same thing: its four waveform
-// slots carry frequency 0, which is outside the documented 10..240 range, and
-// the device drops that channel's whole group (official README, "通道波形频率 /
-// 通道波形强度"). That is what the 2026-09-26 console run streamed: writes went
-// out with rc=0 and the device showed nothing at all.
-//
-// The shape is the socket page's test waveform (100ms, full waveform strength),
-// so the channel strength alone decides how strong a session feels.
-//
-// One entry per slot on purpose. The playback takes one entry per slot and pads
-// whatever is left of the packet with the previous frequency and strength 0
-// (coyote_v3_session.c, fillChannelWaveform), which is the documented way to
-// keep a channel quiet without invalidating its data - and that padding is
-// exactly what a short definition would get: a single entry would put one full
-// pulse in every 100ms packet and leave the other three slots silent, a quarter
-// of the output the same waveform spelled out across the packet has. The count
-// is asserted below so this cannot come back.
-static const DglabCoyoteV3WaveformEntry g_ble_session_waveform[] = {
-    { .frequency_ms = 100u, .strength = 100u },
-    { .frequency_ms = 100u, .strength = 100u },
-    { .frequency_ms = 100u, .strength = 100u },
-    { .frequency_ms = 100u, .strength = 100u },
-};
-
-_Static_assert(sizeof(g_ble_session_waveform) / sizeof(g_ble_session_waveform[0]) ==
-        DGLAB_COYOTE_V3_WAVEFORM_SLOTS,
-    "the session's own waveform has to carry one entry per B0 slot");
-
-// A GATT request that follows a read right away is answered with
-// Bluetooth/0x153 on this firmware: both write types fail and the packet is
-// dropped without a retry (2026-09-25, the two rounds that added the reads).
-// The periodic B0 writes come back a tick later anyway, but the single-shot
-// packets do not, so every read gets a moment of quiet before the next request.
-static void pocBtmSettle(const char* reason)
-{
-    pocLog("btm transport: settle 300ms %s", reason);
-    svcSleepThread(300000000ull);
-}
-
-// Reading through the `bt` service. libnx's read wrappers (bt.c cmd 0 = read
-// characteristic, cmd 1 = read descriptor) pass no buffer and have no out
-// parameter, so whatever the service returns is dropped on the floor - and the
-// firmware's handlers do build a reply (btdrv's case 0x5a/0x5b copy the
-// attribute value and id into a reply buffer after FUN_00077e70 succeeds). This
-// issues the same CMIF command by hand with an out buffer attached, so the value
-// is finally visible. A CCCD read of 0x0001 would answer the question this
-// project has been stuck on: whether RegisterNotification / the hand-written
-// descriptor write really reached the device.
 static void pocBtRawRead(u32 handle, u32 cmd, const BtdrvGattId* serv, const BtdrvGattId* chr,
     const BtdrvGattId* desc, const char* label)
 {
@@ -756,6 +739,9 @@ static bool pocBtmTransportStart(u32 handle, u8 limit_a, u8 limit_b)
     memset(&config, 0, sizeof(config));
     config.bf.soft_limit_a = limit_a;
     config.bf.soft_limit_b = limit_b;
+    config.output_on_demand = blePocSessionIsActive();
+    if (config.output_on_demand)
+        config.strength_feedback = DglabCoyoteV3StrengthFeedback_None;
     dglabCoyoteV3SessionInit(&g_btm_transport.session, &link, &config);
 
     if (POC_BTM_NOTIFY_REGISTER) {
@@ -839,24 +825,14 @@ static bool pocBtmTransportStart(u32 handle, u8 limit_a, u8 limit_b)
     dglabCoyoteV3SessionSetStrengthZero(&g_btm_transport.session, DglabCoyoteV3ChannelA);
     dglabCoyoteV3SessionSetStrengthZero(&g_btm_transport.session, DglabCoyoteV3ChannelB);
 
+    if (config.output_on_demand) {
+        // Flush startup zero before publishing Connected so it cannot supersede
+        // the first test or gameplay strength request.
+        dglabCoyoteV3SessionTick(&g_btm_transport.session, DGLAB_COYOTE_V3_OUTPUT_INTERVAL_MS);
+        g_btm_transport.last_tick_ms = pocNowMs();
+    }
+
     return true;
-}
-
-// Puts the session's own waveform on both channels, replacing whatever the
-// previous phase or client left there. A client that uploads waveform data
-// through NET_WAVEFORM replaces it again - this is only what "a session is
-// running" means for a client that has nothing of its own to play.
-static void pocBleSessionPlayOwnWaveform(void)
-{
-    const size_t entries = sizeof(g_ble_session_waveform) / sizeof(g_ble_session_waveform[0]);
-
-    if (!g_btm_transport.connected)
-        return;
-
-    dglabCoyoteV3SessionSetWaveform(&g_btm_transport.session, DglabCoyoteV3ChannelA,
-        g_ble_session_waveform, entries);
-    dglabCoyoteV3SessionSetWaveform(&g_btm_transport.session, DglabCoyoteV3ChannelB,
-        g_ble_session_waveform, entries);
 }
 
 // Drains the user-side channel and ticks the session for duration_ms.
@@ -1283,12 +1259,13 @@ static DglabCoyoteV3Channel pocBleChannel(u8 channel)
 // session object itself needs no lock; the staging area does.
 static void pocBleSessionApplyInputs(void)
 {
-    DglabNetWaveformRequest waveform;
+    DglabNetWaveformRequest waveform[2];
     PocBleStrengthOp ops[POC_BLE_STRENGTH_QUEUE];
     u32 count = 0u;
     u32 limit_a = 0u;
     u32 limit_b = 0u;
-    bool have_waveform = false;
+    u8 have_waveform = 0;
+    u8 clear_channels = 0;
     bool have_limit = false;
 
     memset(&waveform, 0, sizeof(waveform));
@@ -1309,10 +1286,13 @@ static void pocBleSessionApplyInputs(void)
     }
 
     if (g_ble_waveform_pending) {
-        waveform = g_ble_waveform;
-        have_waveform = true;
-        g_ble_waveform_pending = false;
+        memcpy(waveform, g_ble_waveform, sizeof(waveform));
+        have_waveform = g_ble_waveform_pending;
+        g_ble_waveform_pending = 0;
     }
+
+    clear_channels = g_ble_clear_pending;
+    g_ble_clear_pending = 0;
 
     count = g_ble_strength_count;
 
@@ -1333,27 +1313,34 @@ static void pocBleSessionApplyInputs(void)
         pocBtmTransportSetChannelLimits((u8)limit_a, (u8)limit_b);
     }
 
-    if (have_waveform) {
+    for (u32 channel = 0; channel < 2u; channel++) {
+        if (clear_channels & (1u << channel))
+            dglabCoyoteV3SessionClearWaveform(&g_btm_transport.session,
+                channel == 0u ? DglabCoyoteV3ChannelA : DglabCoyoteV3ChannelB);
+    }
+
+    for (u32 channel = 0; channel < 2u; channel++) {
+        if (!(have_waveform & (1u << channel)))
+            continue;
+
         DglabCoyoteV3WaveformEntry entries[DGLAB_NET_WAVEFORM_MAX_SLOTS];
-        u32 slots = waveform.slot_count;
+        u32 slots = waveform[channel].slot_count;
 
         if (slots > DGLAB_NET_WAVEFORM_MAX_SLOTS)
             slots = DGLAB_NET_WAVEFORM_MAX_SLOTS;
 
         for (u32 i = 0; i < slots; i++) {
-            entries[i].frequency_ms = waveform.slots[i].frequency_ms;
-            entries[i].strength = waveform.slots[i].strength;
+            entries[i].frequency_ms = waveform[channel].slots[i].frequency_ms;
+            entries[i].strength = waveform[channel].slots[i].strength;
         }
 
-        if (slots != 0u) {
-            if (waveform.channel == 1u || waveform.channel == 0u)
-                dglabCoyoteV3SessionSetWaveform(&g_btm_transport.session,
-                    DglabCoyoteV3ChannelA, entries, slots);
-
-            if (waveform.channel == 2u || waveform.channel == 0u)
-                dglabCoyoteV3SessionSetWaveform(&g_btm_transport.session,
-                    DglabCoyoteV3ChannelB, entries, slots);
-        }
+        DglabCoyoteV3Channel target =
+            channel == 0u ? DglabCoyoteV3ChannelA : DglabCoyoteV3ChannelB;
+        bool accepted = waveform[channel].mode == DglabNetWaveform_Append
+            ? dglabCoyoteV3SessionAppendWaveform(&g_btm_transport.session, target, entries, slots)
+            : dglabCoyoteV3SessionSetWaveform(&g_btm_transport.session, target, entries, slots);
+        if (!accepted)
+            pocLog("ble session: waveform rejected on channel %u", (unsigned)(channel + 1u));
     }
 
     for (u32 i = 0; i < count; i++) {
@@ -1403,15 +1390,11 @@ static void pocBtmTransportSession(u32 handle)
         return;
     }
 
-    // From here on the device is "outputting": the two channel strength ceilings
-    // are written (BF, inside the start) and both channels play the session's own
-    // waveform, which is what makes the device's light come on - at strength 0
-    // too, exactly like the App's output switch (see g_ble_session_waveform).
-    pocBleSessionPlayOwnWaveform();
-
+    // Keep the connection available for clients, without a default waveform.
+    // The initial zero request is sent once; subsequent B0 packets require input.
     pocBleSessionSetState(DglabBleState_Connected, true);
-    pocLog("ble session: streaming, channel limits A=%u B=%u (open loop: this "
-        "firmware gives the readback to btm, see docs/ble-re.md)",
+    pocLog("ble startup: protocol ready t=%u ms", pocNowMs());
+    pocLog("ble session: ready, channel limits A=%u B=%u (on demand, open loop)",
         (unsigned)g_ble_limit_a, (unsigned)g_ble_limit_b);
 
     while (!pocStopRequested() && (s32)(deadline - pocNowMs()) > 0 &&
@@ -1447,7 +1430,9 @@ static void pocBleSessionRun(void)
     BtdrvAddress address;
     u32 handle = 0;
     Result rc;
+    u32 start_ms = pocNowMs();
 
+    pocLog("ble startup: begin t=%u ms", start_ms);
     memset(&address, 0, sizeof(address));
     memcpy(address.address, g_ble_address, sizeof(address.address));
 
@@ -1469,7 +1454,10 @@ static void pocBleSessionRun(void)
         pocLog("ble session: connect failed");
         pocBleSessionSetState(DglabBleState_Failed, false);
     } else {
+        pocLog("ble startup: connected elapsed=%u ms", pocNowMs() - start_ms);
         pocBtmLogGatt("ble session", handle);
+        pocLog("ble startup: discovery elapsed=%u ms ready=%u",
+            pocNowMs() - start_ms, g_btm_proto_ready ? 1u : 0u);
 
         if (g_btm_proto_ready) {
             pocBtmTransportSession(handle);
@@ -1478,11 +1466,12 @@ static void pocBleSessionRun(void)
             pocBleSessionSetState(DglabBleState_Failed, false);
         }
 
-        btmBleDisconnect(handle);
-        pocLog("ble session: disconnected");
+        rc = btmBleDisconnect(handle);
+        pocLog("ble session: disconnect handle=%u rc=0x%08X", (unsigned)handle, (u32)rc);
     }
 
     btmExit();
+    pocBtEventsClose();
 
     // The session is over: let a new one start, and leave a non-failure state as
     // "idle" so a client can tell "finished" from "never started".
@@ -1520,7 +1509,8 @@ Result blePocSessionStart(const DglabBleStartRequest* request)
     memset(&g_ble_status, 0, sizeof(g_ble_status));
     memcpy(g_ble_status.address, request->address, sizeof(g_ble_status.address));
     g_ble_status.state = DglabBleState_Connecting;
-    g_ble_waveform_pending = false;
+    g_ble_waveform_pending = 0;
+    g_ble_clear_pending = 0;
     g_ble_limit_pending = false;
     g_ble_strength_count = 0u;
 
@@ -1588,14 +1578,48 @@ bool blePocSessionIsActive(void)
 
 Result blePocSessionUploadWaveform(const DglabNetWaveformRequest* request)
 {
-    if (request == NULL)
+    if (request == NULL || request->channel > 2u ||
+        request->mode > DglabNetWaveform_Replace || request->slot_count == 0u ||
+        request->slot_count > DGLAB_NET_WAVEFORM_MAX_SLOTS)
         return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+
+    for (u32 i = 0; i < request->slot_count; i++) {
+        if (request->slots[i].frequency_ms < DGLAB_COYOTE_V3_WAVEFORM_FREQUENCY_MIN_MS ||
+            request->slots[i].frequency_ms > DGLAB_COYOTE_V3_WAVEFORM_FREQUENCY_MAX_MS ||
+            request->slots[i].strength > DGLAB_COYOTE_V3_WAVEFORM_STRENGTH_MAX)
+            return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    }
 
     mutexLock(&g_ble_mutex);
 
     if (g_ble_active) {
-        g_ble_waveform = *request;
-        g_ble_waveform_pending = true;
+        // Preflight both channels before staging either, so a full queue cannot
+        // turn a two-channel request into a partial upload.
+        for (u32 channel = 0; channel < 2u; channel++) {
+            if ((request->channel == 0u || request->channel == channel + 1u) &&
+                request->mode == DglabNetWaveform_Append &&
+                (g_ble_waveform_pending & (1u << channel)) &&
+                request->slot_count > DGLAB_NET_WAVEFORM_MAX_SLOTS -
+                    g_ble_waveform[channel].slot_count) {
+                mutexUnlock(&g_ble_mutex);
+                return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+            }
+        }
+
+        for (u32 channel = 0; channel < 2u; channel++) {
+            if (request->channel == 0u || request->channel == channel + 1u) {
+                if (request->mode == DglabNetWaveform_Append &&
+                    (g_ble_waveform_pending & (1u << channel))) {
+                    DglabNetWaveformRequest* staged = &g_ble_waveform[channel];
+                    memcpy(staged->slots + staged->slot_count, request->slots,
+                        request->slot_count * sizeof(request->slots[0]));
+                    staged->slot_count += request->slot_count;
+                } else {
+                    g_ble_waveform[channel] = *request;
+                }
+                g_ble_waveform_pending |= (u8)(1u << channel);
+            }
+        }
     }
 
     mutexUnlock(&g_ble_mutex);
@@ -1609,10 +1633,24 @@ Result blePocSessionSend(const DglabNetSendRequest* request)
     if (request == NULL)
         return MAKERESULT(Module_Libnx, LibnxError_BadInput);
 
+    if (request->command == DglabNetCommand_Clear) {
+        if (request->channel > 2u)
+            return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+
+        u8 channels = request->channel == 0u ? 3u : (u8)(1u << (request->channel - 1u));
+        mutexLock(&g_ble_mutex);
+        if (g_ble_active) {
+            g_ble_clear_pending |= channels;
+            g_ble_waveform_pending &= (u8)~channels;
+        }
+        mutexUnlock(&g_ble_mutex);
+        return 0;
+    }
+
     if (request->command != DglabNetCommand_SetStrength &&
         request->command != DglabNetCommand_IncreaseStrength &&
         request->command != DglabNetCommand_DecreaseStrength)
-        return 0; // Clear/TestPulse belong to the Socket mode's app side.
+        return 0; // TestPulse belongs to the Socket mode's app side.
 
     if (request->value > 200u)
         return MAKERESULT(Module_Libnx, LibnxError_BadInput);
@@ -2028,6 +2066,12 @@ static void pocRunBtdrvScanProbe(PocWorker* w)
     u8 client_if = 0xFF;
     bool have_address = false;
     u32 total_scan_results = 0;
+    DglabBlePreparation preparation = { 0 };
+    u32 preparation_start = pocNowMs();
+    const u32 observation_ms = g_poc.short_observation ? 1000u : POC_PROBE_PHONE_WINDOW_MS;
+
+    pocLog("driver preparation: begin t=%u ms observation=%u ms",
+        preparation_start, observation_ms);
 
     // Version marker: if a log has no line below this one, the build that ran
     // is older than the counters (2026-09-21 hardware round).
@@ -2072,14 +2116,17 @@ static void pocRunBtdrvScanProbe(PocWorker* w)
         rc = btdrvInitialize();
         pocLog("btdrv probe: btdrvInitialize rc=0x%08X (attempt %u)", (u32)rc, attempt);
 
-        if (R_FAILED(rc))
+        if (R_FAILED(rc)) {
+            pocFail(rc);
             return;
+        }
 
         memset(&event, 0, sizeof(event));
         rc = btdrvInitializeBle(&event);
         pocLog("btdrv probe: btdrvInitializeBle rc=0x%08X", (u32)rc);
 
         if (R_FAILED(rc)) {
+            pocFail(rc);
             btdrvExit();
             return;
         }
@@ -2159,15 +2206,21 @@ static void pocRunBtdrvScanProbe(PocWorker* w)
     // (the message layer's "no free task slot") right after it. The scans below
     // need it, the connect apparently must not have it first.
     rc = btdrvEnableBle();
+    if (R_FAILED(rc) && R_SUCCEEDED(preparation.critical_result))
+        preparation.critical_result = rc;
     pocLog("btdrv probe: btdrvEnableBle rc=0x%08X", (u32)rc);
     pocControlConnect("after EnableBle");
 
     // Start from a known filter state: a filter left enabled by an earlier run
     // is one of the ways a scan can come back with nothing at all.
     rc = btdrvClearBleScanFilters();
+    if (R_FAILED(rc) && R_SUCCEEDED(preparation.critical_result))
+        preparation.critical_result = rc;
     pocLog("btdrv probe: ClearBleScanFilters rc=0x%08X", (u32)rc);
 
     rc = btdrvEnableBleScanFilter(false);
+    if (R_FAILED(rc) && R_SUCCEEDED(preparation.critical_result))
+        preparation.critical_result = rc;
     pocLog("btdrv probe: EnableBleScanFilter(false) rc=0x%08X", (u32)rc);
 
     // One phase now: the earlier four-mode run (docs/ble-poc.md) showed that
@@ -2187,9 +2240,13 @@ static void pocRunBtdrvScanProbe(PocWorker* w)
         u32 scan_results = 0;
 
         rc = btdrvClearBleScanFilters();
+        if (R_FAILED(rc) && R_SUCCEEDED(preparation.critical_result))
+            preparation.critical_result = rc;
         pocLog("btdrv probe: phase %u: ClearBleScanFilters rc=0x%08X", phase, (u32)rc);
 
         rc = btdrvSetBleScanParameter(kInterval[phase], kWindow[phase]);
+        if (R_FAILED(rc) && R_SUCCEEDED(preparation.critical_result))
+            preparation.critical_result = rc;
         pocLog("btdrv probe: SetBleScanParameter(0x%04X, 0x%04X) rc=0x%08X", kInterval[phase],
             kWindow[phase], (u32)rc);
 
@@ -2208,6 +2265,8 @@ static void pocRunBtdrvScanProbe(PocWorker* w)
             filter.mask_size = 2;
 
             rc = btdrvAddBleScanFilterCondition(&filter);
+            if (R_FAILED(rc) && R_SUCCEEDED(preparation.critical_result))
+                preparation.critical_result = rc;
             pocLog("btdrv probe: AddBleScanFilterCondition(0x%04X, type 0x03) rc=0x%08X",
                 uuid, (u32)rc);
         }
@@ -2229,15 +2288,21 @@ static void pocRunBtdrvScanProbe(PocWorker* w)
             filter.mask_size = 2;
 
             rc = btdrvAddBleScanFilterCondition(&filter);
+            if (R_FAILED(rc) && R_SUCCEEDED(preparation.critical_result))
+                preparation.critical_result = rc;
             pocLog("btdrv probe: AddBleScanFilterCondition(company 0x%04X, type 0xFF) rc=0x%08X",
                 company, (u32)rc);
         }
 
         rc = btdrvEnableBleScanFilter(kPhaseFilterOn[phase]);
+        if (R_FAILED(rc) && R_SUCCEEDED(preparation.critical_result))
+            preparation.critical_result = rc;
         pocLog("btdrv probe: phase %u: EnableBleScanFilter(%u) rc=0x%08X", phase,
             kPhaseFilterOn[phase] ? 1u : 0u, (u32)rc);
 
         rc = btdrvStartBleScan();
+        if (R_FAILED(rc) && R_SUCCEEDED(preparation.critical_result))
+            preparation.critical_result = rc;
         pocLog("btdrv probe: btdrvStartBleScan (phase %u) rc=0x%08X", phase, (u32)rc);
 
         deadline = pocNowMs() + 10000u;
@@ -2373,12 +2438,14 @@ static void pocRunBtdrvScanProbe(PocWorker* w)
         pocLog("btdrv probe: phase %u done fetches=%u empty=%u events=%u scan_results=%u", phase,
             fetches, empties, events, scan_results);
 
-        btdrvStopBleScan();
+        rc = btdrvStopBleScan();
+        pocLog("btdrv probe: phase StopBleScan rc=0x%08X", (u32)rc);
+        preparation.initial_stop_result = (u32)rc;
     }
 
     // The phone window. Keep the same kind of scan running; the moment the
     // target shows up, say so (these lines appear on the console screen, so the
-    // user does not have to time anything), then keep watching for 20 seconds.
+    // user does not have to time anything), then observe for the requested duration (20s diagnostic, 1s NRO).
     // Whether the target's advertisements stop and come back is what separates
     // "the stack refuses" from "the device refuses" (docs/ble-poc.md).
     //
@@ -2403,9 +2470,13 @@ static void pocRunBtdrvScanProbe(PocWorker* w)
         memset(seen, 0, sizeof(seen));
 
         rc = btdrvClearBleScanFilters();
+        if (R_FAILED(rc) && R_SUCCEEDED(preparation.critical_result))
+            preparation.critical_result = rc;
         pocLog("btdrv probe: window: ClearBleScanFilters rc=0x%08X", (u32)rc);
 
         rc = btdrvSetBleScanParameter(0x0060u, 0x0030u);
+        if (R_FAILED(rc) && R_SUCCEEDED(preparation.critical_result))
+            preparation.critical_result = rc;
         pocLog("btdrv probe: window: SetBleScanParameter(0x0060, 0x0030) rc=0x%08X", (u32)rc);
 
         {
@@ -2422,14 +2493,20 @@ static void pocRunBtdrvScanProbe(PocWorker* w)
             filter.mask_size = 2;
 
             rc = btdrvAddBleScanFilterCondition(&filter);
+            if (R_FAILED(rc) && R_SUCCEEDED(preparation.critical_result))
+                preparation.critical_result = rc;
             pocLog("btdrv probe: window: AddBleScanFilterCondition(company 0x%04X) rc=0x%08X",
                 (u32)POC_ADVERTISED_COMPANY_ID, (u32)rc);
         }
 
         rc = btdrvEnableBleScanFilter(true);
+        if (R_FAILED(rc) && R_SUCCEEDED(preparation.critical_result))
+            preparation.critical_result = rc;
         pocLog("btdrv probe: window: EnableBleScanFilter(true) rc=0x%08X", (u32)rc);
 
         rc = btdrvStartBleScan();
+        if (R_FAILED(rc) && R_SUCCEEDED(preparation.critical_result))
+            preparation.critical_result = rc;
         pocLog("btdrv probe: window: btdrvStartBleScan rc=0x%08X", (u32)rc);
 
         scan_deadline = pocNowMs() + POC_PROBE_FIND_MS;
@@ -2452,7 +2529,7 @@ static void pocRunBtdrvScanProbe(PocWorker* w)
                     advertising = now_advertising;
                     pocLog("btdrv probe: window: target %s advertising (%us in)",
                         advertising ? "is" : "stopped",
-                        (unsigned)((now - (window_end - POC_PROBE_PHONE_WINDOW_MS)) / 1000u));
+                        (unsigned)((now - (window_end - observation_ms)) / 1000u));
                 }
             }
 
@@ -2525,6 +2602,7 @@ static void pocRunBtdrvScanProbe(PocWorker* w)
                         // after the window fall back to the configured address.
                         memcpy(g_poc.target_address, info.scan_result.address.address, 6);
                         g_poc.use_target_address = true;
+                        phone_target = info.scan_result.address;
                         scanned_address = info.scan_result.address;
                         have_address = true;
                     }
@@ -2533,23 +2611,31 @@ static void pocRunBtdrvScanProbe(PocWorker* w)
 
             if (memcmp(info.scan_result.address.address, phone_target.address, 6) == 0) {
                 target_seen = true;
+                preparation.target_seen = true;
                 target_last_ms = now;
 
                 if (window_end == 0u) {
-                    window_end = now + POC_PROBE_PHONE_WINDOW_MS;
-                    pocLog("btdrv probe: >>> TAP CONNECT ON THE PHONE NOW <<<");
+                    window_end = now + observation_ms;
+                    if (!g_poc.short_observation)
+                        pocLog("btdrv probe: >>> TAP CONNECT ON THE PHONE NOW <<<");
                     pocLog("btdrv probe: >>> watching the advertisement for %u more seconds <<<",
-                        (unsigned)(POC_PROBE_PHONE_WINDOW_MS / 1000u));
+                        (unsigned)(observation_ms / 1000u));
                 }
             }
         }
 
-        btdrvStopBleScan();
+        rc = btdrvStopBleScan();
+        pocLog("btdrv probe: final StopBleScan rc=0x%08X", (u32)rc);
+        preparation.final_scan_stopped = R_SUCCEEDED(rc);
+        if (R_FAILED(rc) && R_SUCCEEDED(preparation.critical_result))
+            preparation.critical_result = rc;
         pocLog("btdrv probe: window done fetches=%u devices=%u target_seen=%u",
             fetches, devices, target_seen ? 1u : 0u);
     }
 
-    btdrvClearBleScanFilters();
+    rc = btdrvClearBleScanFilters();
+    if (R_FAILED(rc) && R_SUCCEEDED(preparation.critical_result))
+        preparation.critical_result = rc;
     pocLog("btdrv probe: done, %u scan result(s) in total", total_scan_results);
 
     pocBtEventsClose();
@@ -2568,7 +2654,7 @@ static void pocRunBtdrvScanProbe(PocWorker* w)
 
     if (!have_address) {
         pocLog("btdrv probe: no address to connect to (client_if=0x%02X)", client_if);
-    } else {
+    } else if (!pocStopRequested()) {
         // Connect with the interface our own registration reported (if the
         // registration went through at all), now that the device has been seen
         // in a scan.
@@ -2586,6 +2672,21 @@ static void pocRunBtdrvScanProbe(PocWorker* w)
 
     eventClose(&event);
     btdrvExit();
+
+    Result preparation_result = dglabBlePreparationResult(&preparation, g_poc.short_observation);
+    if (R_SUCCEEDED(preparation_result) && preparation.initial_stop_result != 0)
+        pocLog("driver preparation: initial stop rc=0x%08X recovered by target scan and final stop",
+            preparation.initial_stop_result);
+    if (g_poc.short_observation && !preparation.target_seen)
+        pocLog("driver preparation: target not seen, formal connection skipped; reboot before retrying");
+    if (R_FAILED(preparation_result))
+        pocFail(preparation_result);
+    else if (!pocStopRequested())
+        pocSetMilestone(DGLAB_POC_MILESTONE_DRIVER_READY);
+
+    pocLog("driver preparation: end t=%u ms elapsed=%u ms rc=0x%08X cancelled=%u",
+        pocNowMs(), pocNowMs() - preparation_start, (u32)preparation_result,
+        pocStopRequested() ? 1u : 0u);
 }
 
 // Drains btdrv's managed BLE event queue for a while and logs every non-empty
@@ -3125,11 +3226,14 @@ static u32 pocBtFindConnectionEvent(const BtdrvAddress* addr, u32 timeout_ms)
                 last_conn_id = g_ble_event.client_connection.conn_id;
                 last_reason = g_ble_event.client_connection.reason;
 
-                pocLog("%s: bt connection event status=%u conn_id=%u reason=0x%04X", "btm probe",
-                    last_status, last_conn_id, last_reason);
+                pocLog("%s: bt connection event status=%u conn_id=%u reason=0x%04X client_if=%u result=0x%08X",
+                    "btm probe", last_status, last_conn_id, last_reason,
+                    (unsigned)g_ble_event.client_connection.client_if,
+                    (u32)g_ble_event.client_connection.result);
             }
 
-            if (g_ble_event.client_connection.status == 0u) {
+            if (g_ble_event.client_connection.status == 0u &&
+                R_SUCCEEDED(g_ble_event.client_connection.result)) {
                 conn_id = g_ble_event.client_connection.conn_id;
                 break;
             }
@@ -3144,9 +3248,10 @@ static u32 pocBtFindConnectionEvent(const BtdrvAddress* addr, u32 timeout_ms)
     return conn_id;
 }
 
-// Connect with a few retries: btm/the stack answer 0x668F ("no free task slot")
-// for a moment after the BLE stack was turned on, and a refused attempt leaves
-// nothing behind, so retrying is safe.
+static Result g_btm_connect_result; // worker-only result of the last connect request
+
+// Retain the original retries for rejected requests, but stop on an in-flight
+// task (0x668F) or an accepted connect that timed out. Neither may be resubmitted.
 static bool pocBtmConnectRetry(const char* label, const BtdrvAddress* addr, u32* out_handle)
 {
     for (u32 attempt = 0; attempt < 3u && !pocStopRequested(); attempt++) {
@@ -3157,6 +3262,13 @@ static bool pocBtmConnectRetry(const char* label, const BtdrvAddress* addr, u32*
 
         if (pocBtmConnectTry(label, addr, out_handle))
             return true;
+        if (g_btm_connect_result == 0x668Fu || R_SUCCEEDED(g_btm_connect_result)) {
+            mutexLock(&g_poc.mutex);
+            g_poc.reboot_required = true;
+            mutexUnlock(&g_poc.mutex);
+            pocLog("%s: connect pending/busy; reboot before retrying", label);
+            break;
+        }
     }
 
     return false;
@@ -3175,6 +3287,7 @@ static bool pocBtmConnectTry(const char* label, const BtdrvAddress* addr, u32* o
     memset(&conn_event, 0, sizeof(conn_event));
 
     rc = btmBleConnect(*addr);
+    g_btm_connect_result = rc;
     pocLog("%s: BleConnect(%02X:%02X:%02X:%02X:%02X:%02X) rc=0x%08X", label,
         addr->address[0], addr->address[1], addr->address[2], addr->address[3],
         addr->address[4], addr->address[5], (u32)rc);
@@ -3317,8 +3430,8 @@ static void pocBtmLogGatt(const char* label, u32 handle)
             memset(g_btm_services, 0, sizeof(g_btm_services));
             total = 0;
             rc = btmGetGattServices(handle, g_btm_services, POC_BTM_SERVICE_MAX, &total);
-            pocLog("%s: GetGattServices attempt %u rc=0x%08X total=%u", label, attempt,
-                (u32)rc, (unsigned)total);
+            pocLog("%s: GetGattServices handle=%u attempt=%u rc=0x%08X total=%u", label,
+                (unsigned)handle, attempt, (u32)rc, (unsigned)total);
 
             if (R_SUCCEEDED(rc) && total > 0u)
                 break;
@@ -3734,7 +3847,8 @@ static void pocThreadFunc(void* arg)
     pocLog("poc start aruid_low=0x%08X", (u32)g_poc.aruid);
     // Printed by every session so a log says which sysmodule build produced it;
     // the probe versions below only appear when their key is pressed.
-    pocLog("poc build: ble_poc v35 (discovery window runs without a configured address)");
+    pocLog("poc build: %s, ble startup v40 (verified scan-stop recovery, one-shot preparation)",
+        DGLAB_BUILD_STAMP);
 
     // The NRO sends START and the first ACTION back to back, so give that action
     // a moment to arrive before any probe runs: both probes care about what has
@@ -3773,7 +3887,18 @@ static void pocThreadFunc(void* arg)
     // only way to see the advertisement with the driver in control.
     if (w->probe_btdrv) {
         w->probe_btdrv = false;
+        if (g_poc.short_observation) {
+            mutexLock(&g_poc.mutex);
+            g_poc.short_preparation_used = true;
+            mutexUnlock(&g_poc.mutex);
+        }
         pocRunBtdrvScanProbe(w);
+        if (g_poc.short_observation) {
+            mutexLock(&g_poc.mutex);
+            if (g_poc.status.state == DglabPocState_Failed || g_poc.stop_requested)
+                g_poc.reboot_required = true;
+            mutexUnlock(&g_poc.mutex);
+        }
     }
 
     // What used to be here - the btdev scan/connect/discover/subscribe route and
@@ -3782,7 +3907,7 @@ static void pocThreadFunc(void* arg)
     // docs/ble-re.md), the identity probe's question (do libnx's btdrv command
     // numbers still match the firmware's) is settled, and the btm:u path is
     // applet-only. docs/history.md keeps the record of all of them.
-    pocLog("poc session: no probe requested, nothing to do");
+    pocLog("poc session: worker finished");
 
     mutexLock(&g_poc.mutex);
     bool failed = g_poc.status.state == DglabPocState_Failed;
@@ -3816,6 +3941,19 @@ Result blePocStart(const DglabPocStartRequest* request)
 
     mutexLock(&g_poc.mutex);
 
+    if (g_poc.reboot_required) {
+        mutexUnlock(&g_poc.mutex);
+        pocLog("start blocked: BLE state requires reboot");
+        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    }
+
+    if ((request->flags & DGLAB_POC_START_FLAG_SHORT_OBSERVATION) &&
+        g_poc.short_preparation_used) {
+        mutexUnlock(&g_poc.mutex);
+        pocLog("start blocked: driver preparation already ran, reboot required");
+        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    }
+
     if (g_poc.running) {
         mutexUnlock(&g_poc.mutex);
         return MAKERESULT(Module_Libnx, LibnxError_BadInput);
@@ -3830,16 +3968,25 @@ Result blePocStart(const DglabPocStartRequest* request)
     // mapping would then stay behind for good (docs/dglab-socket.md, "反复启停后
     // 服务端起不来").
     if (g_poc.worker_thread.handle != INVALID_HANDLE) {
+        // IPC must never wait for Bluetooth cleanup. The NRO retries on the
+        // next frame, while STATUS/LOG and input remain available.
+        Result ready_rc = svcWaitSynchronizationSingle(g_poc.worker_thread.handle, 0);
+        if (R_FAILED(ready_rc))
+            return ready_rc;
         Result wait_rc = threadWaitForExit(&g_poc.worker_thread);
         Result close_rc;
 
-        if (R_FAILED(wait_rc))
+        if (R_FAILED(wait_rc)) {
             pocLog("worker did not exit, rc=0x%08X", (u32)wait_rc);
+            return wait_rc;
+        }
 
         close_rc = threadClose(&g_poc.worker_thread);
 
-        if (R_FAILED(close_rc))
+        if (R_FAILED(close_rc)) {
             pocLog("worker close rc=0x%08X (its stack was not released)", (u32)close_rc);
+            return close_rc;
+        }
     }
 
     mutexLock(&g_poc.mutex);
@@ -3847,18 +3994,17 @@ Result blePocStart(const DglabPocStartRequest* request)
     memset(&g_poc.status, 0, sizeof(g_poc.status));
 
     // The ring is NOT cleared here: the NRO's reader polls every frame, and
-    // wiping the ring at session start threw away whatever the previous session
-    // (or the probe that runs in this one) had written but not been read yet -
-    // the 2026-09-21 hardware round lost the whole identity probe that way.
-    // log_write_offset stays monotonic and readers only take what is newer than
-    // log_valid_from, so old bytes are simply never handed out again.
-    g_poc.log_valid_from = g_poc.log_write_offset;
+    // both its bytes and reader cursors stay monotonic across the two startup
+    // stages. Advancing log_valid_from here also dropped unread final lines,
+    // even without clearing the bytes, so only ring overflow clamps readers.
+    // Retain unread previous-worker lines across the two startup stages.
 
     g_poc.status.state = DglabPocState_Initializing;
     g_poc.pending_action = 0;
     g_poc.stop_requested = false;
     g_poc.aruid = request->applet_resource_user_id;
     g_poc.status.aruid_low = (u32)g_poc.aruid;
+    g_poc.short_observation = (request->flags & DGLAB_POC_START_FLAG_SHORT_OBSERVATION) != 0;
     g_poc.use_target_address = (request->flags & DGLAB_POC_START_FLAG_TARGET_ADDRESS) != 0;
     memcpy(g_poc.target_address, request->target_address, sizeof(g_poc.target_address));
     g_poc.running = true;
@@ -3940,8 +4086,8 @@ u32 blePocReadLog(u32 cursor, char* out, u32 out_size)
     write = g_poc.log_write_offset;
     earliest = (write > POC_LOG_CAPACITY) ? write - POC_LOG_CAPACITY : 0;
 
-    // Never hand out bytes from before the current run: the ring is cleared at
-    // start, and starting mid line also produced a truncated first line.
+    // log_valid_from is initialized with the ring, not advanced between workers.
+    // Readers can drain the previous worker's final lines after BLE_START.
     if (g_poc.log_valid_from > earliest)
         earliest = g_poc.log_valid_from;
 

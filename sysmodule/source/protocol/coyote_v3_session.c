@@ -23,7 +23,7 @@ static bool isEntryValid(const DglabCoyoteV3WaveformEntry* entry)
 
 // Fills one packet's four waveform slots for a channel.
 //
-// The waveform repeats, and each repetition starts on a packet boundary. When a
+// Continuous mode repeats on packet boundaries; on-demand mode consumes once. When a
 // repetition ends in the middle of a packet the remaining slots are padded with
 // the last frequency and strength 0.
 //
@@ -34,7 +34,7 @@ static bool isEntryValid(const DglabCoyoteV3WaveformEntry* entry)
 // strength. A channel without waveform data keeps the zeroed slots, which is
 // the documented single channel technique.
 static void fillChannelWaveform(DglabCoyoteV3WaveformChannel* waveform,
-    DglabCoyoteV3WaveformSlot* slots)
+    DglabCoyoteV3WaveformSlot* slots, bool repeat)
 {
     if (waveform->count == 0)
         return;
@@ -44,7 +44,7 @@ static void fillChannelWaveform(DglabCoyoteV3WaveformChannel* waveform,
 
     while (filled < DGLAB_COYOTE_V3_WAVEFORM_SLOTS) {
         if (waveform->position >= waveform->count) {
-            if (filled == 0) {
+            if (filled == 0 && repeat) {
                 // A new repetition starts exactly on this packet boundary.
                 waveform->position = 0;
                 continue;
@@ -66,6 +66,11 @@ static void fillChannelWaveform(DglabCoyoteV3WaveformChannel* waveform,
         slots[filled].frequency = last_frequency;
         slots[filled].strength = 0;
     }
+
+    if (!repeat && waveform->position >= waveform->count) {
+        waveform->count = 0;
+        waveform->position = 0;
+    }
 }
 
 static void writeB0(DglabCoyoteV3Session* session)
@@ -74,8 +79,8 @@ static void writeB0(DglabCoyoteV3Session* session)
     uint8_t encoded[DGLAB_COYOTE_V3_B0_SIZE];
 
     dglabCoyoteV3StrengthStateApplyToPacket(&session->strength, &packet);
-    fillChannelWaveform(&session->waveform_a, packet.waveform_a);
-    fillChannelWaveform(&session->waveform_b, packet.waveform_b);
+    fillChannelWaveform(&session->waveform_a, packet.waveform_a, !session->output_on_demand);
+    fillChannelWaveform(&session->waveform_b, packet.waveform_b, !session->output_on_demand);
 
     dglabCoyoteV3EncodeB0(&packet, encoded);
     emit(session, encoded, sizeof(encoded));
@@ -110,6 +115,7 @@ void dglabCoyoteV3SessionInit(DglabCoyoteV3Session* session, const DglabCoyoteV3
 
     session->bf = defaults.bf;
     session->strength_feedback = defaults.strength_feedback;
+    session->output_on_demand = defaults.output_on_demand;
 
     dglabCoyoteV3StrengthStateInit(&session->strength, defaults.strength_feedback);
 }
@@ -188,6 +194,31 @@ bool dglabCoyoteV3SessionSetWaveform(DglabCoyoteV3Session* session,
     return true;
 }
 
+bool dglabCoyoteV3SessionAppendWaveform(DglabCoyoteV3Session* session,
+    DglabCoyoteV3Channel channel, const DglabCoyoteV3WaveformEntry* entries, size_t count)
+{
+    if (!session->output_on_demand || entries == NULL || count == 0 ||
+        count > DGLAB_COYOTE_V3_WAVEFORM_CAPACITY)
+        return false;
+
+    DglabCoyoteV3WaveformChannel* waveform = waveformFor(session, channel);
+    size_t remaining = waveform->count - waveform->position;
+    if (count > DGLAB_COYOTE_V3_WAVEFORM_CAPACITY - remaining)
+        return false;
+
+    for (size_t i = 0; i < count; i++) {
+        if (!isEntryValid(&entries[i]))
+            return false;
+    }
+
+    memmove(waveform->entries, waveform->entries + waveform->position,
+        remaining * sizeof(*entries));
+    memcpy(waveform->entries + remaining, entries, count * sizeof(*entries));
+    waveform->count = remaining + count;
+    waveform->position = 0;
+    return true;
+}
+
 void dglabCoyoteV3SessionClearWaveform(DglabCoyoteV3Session* session,
     DglabCoyoteV3Channel channel)
 {
@@ -212,6 +243,13 @@ void dglabCoyoteV3SessionTick(DglabCoyoteV3Session* session, uint32_t elapsed_ms
     // Drop any further missed intervals instead of writing them back to back.
     if (session->elapsed_ms >= DGLAB_COYOTE_V3_OUTPUT_INTERVAL_MS)
         session->elapsed_ms %= DGLAB_COYOTE_V3_OUTPUT_INTERVAL_MS;
+
+    if (session->output_on_demand && session->waveform_a.count == 0 &&
+        session->waveform_b.count == 0 &&
+        (session->strength.waiting_for_b1 ||
+            (session->strength.pending_a == 0 && session->strength.pending_b == 0 &&
+                !session->strength.zero_pending_a && !session->strength.zero_pending_b)))
+        return;
 
     writeB0(session);
 }

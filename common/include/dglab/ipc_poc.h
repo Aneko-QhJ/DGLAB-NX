@@ -38,6 +38,10 @@ typedef enum {
 #define DGLAB_POC_MILESTONE_DEVICE_FOUND  (1u << 0)
 #define DGLAB_POC_MILESTONE_CONNECTED     (1u << 1)
 #define DGLAB_POC_MILESTONE_SERVICE_FOUND (1u << 2)
+// Driver initialization, enable, scan setup/start, final stop and cleanup succeeded.
+// A first-phase stop rejection may recover after verified target scan/final stop.
+// Diagnostic GATT/control connects are not preparation requirements.
+#define DGLAB_POC_MILESTONE_DRIVER_READY  (1u << 3)
 
 // The console has exactly two actions left. Each one runs a whole session of its
 // own, in this order: the driver-level probe first (it is what brings the BLE
@@ -56,6 +60,9 @@ enum {
 // because btm's scan filters are system configured and may not match a generic
 // BLE peripheral.
 #define DGLAB_POC_START_FLAG_TARGET_ADDRESS (1u << 0)
+// Keep the driver sequence; shorten only the post-target observation to 1s.
+// Without this flag the diagnostic console retains its 20s phone window.
+#define DGLAB_POC_START_FLAG_SHORT_OBSERVATION (1u << 1)
 
 typedef struct {
     u64 applet_resource_user_id;

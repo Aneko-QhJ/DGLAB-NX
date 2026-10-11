@@ -38,15 +38,32 @@ NET_STATUS 顺带刷新局域网地址。App 上报字段只代表收到的报�
 
 BLE_START 带设备地址与 A/B 通道上限，地址由扫描写入 `config/dglab-ble-address.txt`，
 NRO 读出后传入。上限和强度是独立的两组 A/B 值：前者是 BF 设备钳制值，后者是客户端请求值。
+NRO 先运行驱动级探针，再发 BLE_START，由 btm 连接。POC_START 的可选
+`SHORT_OBSERVATION` 标志只将找到目标后的观察窗口从 20 秒缩短到 1 秒；
+原有初始化、注册、两轮扫描和诊断调用顺序保留，诊断入口不带该标志。
+POC_STATUS 的 `DRIVER_READY` milestone 要求开栈、启用、扫描配置/启动、最终停止
+和清理成功；NRO 正式入口还要求第二轮实际发现目标。HOS 22.5.0 实测第一轮
+StopBleScan 可返回 0x0002A871，仅当后续目标扫描和最终停止成功时允许恢复该返回值；
+其它关键错误不恢复，取消不置位；诊断性客户端注册/连接失败不作为准备失败。
+NRO 驱动准备每次开机只运行一次；准备失败/取消后拒绝再次启动，须重启。NRO 仅在状态 Stopped、
+last_result=0 且 DRIVER_READY 置位时发送 BLE_START；状态读取失败或准备失败即终止。
+命令号和请求/回复布局不变；新版 NRO 遇到旧服务缺少标记时拒绝继续，需一起更新。
+遇到 0x668F 或连接请求受理后超时，拒绝本次开机的后续 START；下一轮必须重启。
+旧工作线程尚未退出时 START 返回 Kernel/TimedOut，客户端后续帧重试；
+STATUS/LOG 保持可用，PoC 日志跨工作线程保留未读尾部。
 BLE_LIMIT 用于运行中改上限，避免停会话重连；无会话时应由 BLE_START 带入。
 
 会话激活时 NET_SEND 的强度请求及 NET_WAVEFORM 路由到本地协议层；BLE_STOP 后回到
-Socket 转发。玩法不需要另建传输接口。当前 BLE transport 会忽略 NET_SEND 的 Clear/TestPulse，
-NET_WAVEFORM 则接收最新一批替换当前波形，不复用 Socket 的 Append 排队行为。
-不能仅因 NET_* 名称相同就假定两种传输全部等价。
+Socket 转发。玩法不需要另建传输接口。BLE 的 Clear 清除指定通道波形（channel=0 为两路），
+保留连接和强度设置；TestPulse 仍被忽略，测试使用 NET_WAVEFORM 加 SetStrength。
+NET_WAVEFORM 按通道处理：Append 追加未播槽，Replace 替换对应通道；每批仅播放一次。
+IPC 暂存每路最多 48 槽，协议待播队列每路最多 128 槽；暂存满则拒绝请求，
+工作线程待播队列满则记录拒绝日志。不能仅因 NET_* 名称相同就假定两种传输全部等价。
 
 BLE 按开环设计：BLE_STATUS 的强度是请求记账，不能显示为真实强度，不支持依设备当前值加减。
-会话自带有效默认波形，所以强度/上限为 0 时灯仍可能闪；STOP 先写 BF=0，再清波形归零后断开。
+正式会话连接后仅写 BF 和一次 A/B 归零，不自带波形；无波形或待发强度请求时不发 B0。
+测试/玩法波形按 100ms 节奏发送，播完回到空闲；强度请求用序列号 0，不等待 B1。
+STOP 先写 BF=0，再清波形归零后断开。
 使用前必须安装补丁、确认设备未绑定，并遵守一个开机周期一条 BLE 路径，详见
 [BLE 验证](ble-poc.md) 与 [固件研究](ble-re.md)。
 

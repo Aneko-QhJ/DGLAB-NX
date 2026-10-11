@@ -54,6 +54,9 @@ typedef struct {
     // reference algorithm in the documentation and is the default, because it is
     // the enum's zero value.
     DglabCoyoteV3StrengthFeedback strength_feedback;
+    // Play each uploaded batch once and write B0 only for waveform or strength
+    // input. False preserves the diagnostic probe's continuous, looping stream.
+    bool output_on_demand;
 } DglabCoyoteV3SessionConfig;
 
 typedef struct {
@@ -64,6 +67,7 @@ typedef struct {
     DglabCoyoteV3WaveformChannel waveform_a;
     DglabCoyoteV3WaveformChannel waveform_b;
     bool connected;
+    bool output_on_demand;
     uint32_t elapsed_ms;
 } DglabCoyoteV3Session;
 
@@ -97,10 +101,16 @@ void dglabCoyoteV3SessionSetStrengthZero(DglabCoyoteV3Session* session,
     DglabCoyoteV3Channel channel);
 
 // Sets the waveform a channel plays. Entries are sent in order, four per B0
-// packet, and the sequence repeats until it is cleared. Returns false and
+// packet. In output_on_demand mode the batch plays once; otherwise it repeats
+// until cleared. Returns false and
 // leaves the current waveform untouched when count is 0, larger than
 // DGLAB_COYOTE_V3_WAVEFORM_CAPACITY, or when any entry is out of range.
 bool dglabCoyoteV3SessionSetWaveform(DglabCoyoteV3Session* session,
+    DglabCoyoteV3Channel channel, const DglabCoyoteV3WaveformEntry* entries, size_t count);
+
+// Appends to the unplayed entries of an on-demand channel. Invalid input or a
+// full queue leaves playback untouched. Not supported for looping sessions.
+bool dglabCoyoteV3SessionAppendWaveform(DglabCoyoteV3Session* session,
     DglabCoyoteV3Channel channel, const DglabCoyoteV3WaveformEntry* entries, size_t count);
 
 // Stops playing a channel's waveform. The channel is written as idle data,
@@ -108,7 +118,8 @@ bool dglabCoyoteV3SessionSetWaveform(DglabCoyoteV3Session* session,
 void dglabCoyoteV3SessionClearWaveform(DglabCoyoteV3Session* session,
     DglabCoyoteV3Channel channel);
 
-// Advances time. Every completed 100ms interval writes one B0 packet.
+// Advances time. Every completed 100ms interval may write one B0 packet.
+// output_on_demand sessions stay silent when no waveform or strength is queued.
 //
 // At most one packet is written per call: a caller that arrives late must not
 // turn the missed intervals into a burst of writes. The sub interval remainder
