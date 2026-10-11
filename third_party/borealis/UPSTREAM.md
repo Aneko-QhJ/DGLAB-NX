@@ -23,6 +23,9 @@ from pl:u at runtime; MaterialIcons retains resources/material/LICENSE.txt.
 
 Local changes:
 
+- Bundled tinyxml2 headers precede installed copies. The host exposes portlibs
+  headers as system includes only to the framework and its consumers, so fmt
+  and tinyxml2 compile against the headers from their pinned source snapshot.
 - BRLS_CUSTOM_PLATFORM excludes the stock platform factory, Switch drivers,
   libpulsar and notifications. DGLAB-NX supplies platform/HID/font/IME/audio interfaces.
 - Application::releaseWindowState clears UI callbacks, animations, activities,

@@ -36,9 +36,10 @@ if(UI_BACKEND STREQUAL "borealis")
     set(BRLS_UNITY_BUILD OFF)
     # Custom platform owns HID/services; notifications and audio are unused.
     add_compile_definitions(DGLAB_BOREALIS_MINIMAL __SWITCH__ __GLFW__)
-    include_directories("${DGLAB_PORTLIBS}/include")
     link_directories("${DGLAB_PORTLIBS}/lib")
     add_subdirectory("${ROOT}/third_party/borealis/library" "borealis")
+    # Bundled headers must precede any older copies in devkitPro portlibs.
+    target_include_directories(borealis SYSTEM PUBLIC "${DGLAB_PORTLIBS}/include")
     target_compile_definitions(borealis PRIVATE STBTT_STATIC)
     target_link_directories(DGLAB-NX PRIVATE "${DGLAB_PORTLIBS}/lib")
     target_sources(DGLAB-NX PRIVATE source/borealis/native.cpp source/borealis/gameplay.cpp source/borealis/about.cpp)
