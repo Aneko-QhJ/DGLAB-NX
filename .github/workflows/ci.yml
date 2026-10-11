@@ -32,7 +32,7 @@ jobs:
     name: build + host tests
     runs-on: ubuntu-latest
     container:
-      image: devkitpro/devkita64:latest
+      image: devkitpro/devkita64:20260219
 
     steps:
       - name: Check out
@@ -97,10 +97,17 @@ jobs:
           echo "cc: $(cc --version 2>&1 | head -n1)"
           ls "$DEVKITPRO/libnx/include/switch" >/dev/null 2>&1 && \
             echo "libnx headers: present" || echo "::warning::libnx headers not found"
-          for pkg in libnx switch-tools devkitA64; do
+          for pkg in libnx switch-tools devkitA64 switch-glfw switch-mesa switch-glm; do
             echo "$pkg: $(dkp-pacman -Q "$pkg" 2>/dev/null || echo 'version unknown')"
           done
           echo "npdmtool: $(npdmtool 2>&1 | head -n1)"
+          cmake --version || { echo "::error::missing CMake"; exit 1; }
+          for lib in glfw3 EGL glapi drm_nouveau; do
+            test -f "$DEVKITPRO/portlibs/switch/lib/lib${lib}.a" || {
+              echo "::error::missing Switch library: $lib"; exit 1;
+            }
+          done
+          test -f "$DEVKITPRO/portlibs/switch/include/glm/glm.hpp" || exit 1
 
       - name: Host tests
         shell: bash
@@ -158,6 +165,14 @@ jobs:
             echo "::error::make (tail): $line"
           done < <(tail -n6 "$log")
           exit 1
+
+      - name: Check framebuffer reference build
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -C nro UI_BACKEND=framebuffer
+          # Restore the native NRO before assembling/uploading the release.
+          make -C nro UI_BACKEND=borealis
 
       - name: Assemble the SD card layout
         shell: bash

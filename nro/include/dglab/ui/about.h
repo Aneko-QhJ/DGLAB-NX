@@ -47,3 +47,6 @@ void dglabAboutDraw(DglabCanvas* canvas, const DglabFontSet* fonts, const DglabA
 /// height - the row array itself never leaves this file, so the height the keys
 /// stop at and the pixels on screen come from one measurement.
 int dglabAboutContentHeight(const DglabFontSet* fonts, const DglabAboutState* state);
+
+const char* dglabAboutLanguageValue(const DglabAboutState* state, char* out, size_t size);
+const char* dglabAboutThemeValue(const DglabAboutState* state, char* out, size_t size);

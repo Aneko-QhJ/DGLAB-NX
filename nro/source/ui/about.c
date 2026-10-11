@@ -30,7 +30,7 @@
 // asks for and the draw itself walk the same rows.
 #define ABOUT_ROW_COUNT 8
 
-static const char* languageValue(const DglabAboutState* state, char* buffer, size_t size)
+const char* dglabAboutLanguageValue(const DglabAboutState* state, char* buffer, size_t size)
 {
     const char* name;
 
@@ -58,7 +58,7 @@ static const char* languageValue(const DglabAboutState* state, char* buffer, siz
 // The theme row's value, in the same shape as the language one: Auto says what
 // it currently means, because "follow the console" on its own does not say
 // whether the screen the user is looking at is the light or the dark palette.
-static const char* themeValue(const DglabAboutState* state, char* buffer, size_t size)
+const char* dglabAboutThemeValue(const DglabAboutState* state, char* buffer, size_t size)
 {
     const char* name;
 
@@ -91,8 +91,8 @@ static int buildRows(const DglabAboutState* state, DglabRow* rows, char* ipc_ver
 
     snprintf(ipc_version, ipc_size, "%u.%u.%u", (unsigned)state->ipc_version.major,
         (unsigned)state->ipc_version.minor, (unsigned)state->ipc_version.patch);
-    languageValue(state, language, language_size);
-    themeValue(state, theme, theme_size);
+    dglabAboutLanguageValue(state, language, language_size);
+    dglabAboutThemeValue(state, theme, theme_size);
 
     rows[count++] = (DglabRow){
         .kind = DglabRow_Paragraph,

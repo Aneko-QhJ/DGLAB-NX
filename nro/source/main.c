@@ -1,15 +1,15 @@
 // DGLAB-NX front end.
 //
 // Polls the sysmodule over IPC, feeds the result into the screen layout, and
-// turns button presses into IPC commands. The drawing itself lives in
-// dglab/ui/screen.c, which stays free of libnx so it can be rendered and
-// checked on a PC.
+// turns button presses into IPC commands. Both UI backends use the same C
+// page controller; rendering lives in borealis/ and ui/.
 //
 // The NRO never owns a DG-LAB connection: the sysmodule is the only owner, and
 // everything here goes through the IPC surface in dglab/ipc.h.
 
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -25,6 +25,7 @@
 #include <dglab/nro/auto_sleep.h>
 #include <dglab/nro/joycon.h>
 #include <dglab/platform/font.h>
+#include <dglab/platform/log_file.h>
 #include <dglab/ui/about.h>
 #include <dglab/ui/ble.h>
 #include <dglab/ui/language.h>
@@ -34,7 +35,6 @@
 #include <dglab/nro/motion_settings.h>
 #include <dglab/nro/touch_feed.h>
 #include <dglab/nro/touch_panel.h>
-#include <dglab/nro/ble_poc_view.h>
 #include <dglab/platform/framebuffer.h>
 #include <dglab/platform/touchscreen.h>
 #include <dglab/ui/advanced.h>
@@ -45,6 +45,8 @@
 #include <dglab/ui/settings.h>
 #include <dglab/ui/theme.h>
 #include <dglab/ui/touch.h>
+#include <dglab/ui/native.h>
+#include <dglab/ui/input_state.h>
 
 #define LOG_POLL_ROUNDS 2
 
@@ -67,20 +69,12 @@
 // The app level settings (the UI language and the colour theme).
 #define APP_CONFIG_PATH CONFIG_DIR "/app.cfg"
 
-typedef enum {
-    DglabMenuResult_Exit = 0,
-    DglabMenuResult_Socket,
-    DglabMenuResult_Ble,
-    DglabMenuResult_Motion,
-    DglabMenuResult_Touch,
-    DglabMenuResult_Advanced,
-    DglabMenuResult_About,
-    DglabMenuResult_BlePoc,
-} DglabMenuResult;
+
 
 // The four sizes every screen draws with: the system shared font at the sizes
 // the console's own UI uses (docs/nro-ui.md), or libnx's bitmap font when that
 // cannot be loaded - which only has ASCII, so Chinese text would show as gaps.
+static bool g_framebuffer_ready;
 static DglabFontSet g_fonts;
 static DglabFontSet g_bitmap_fonts;
 static DglabAppSettings g_settings;
@@ -100,7 +94,9 @@ static bool g_set_sys_ready;
 // Bumped whenever the display is rebuilt: a new framebuffer is blank, and the
 // fonts are rasterised anew for it (the docked frame is 1.5x the handheld one),
 // so every screen has to draw again even if nothing else about it changed.
+#ifndef DGLAB_UI_BOREALIS
 static u32 g_display_generation;
+#endif
 
 static void appSettingsSave(void)
 {
@@ -143,6 +139,8 @@ static void appLanguageApply(void)
 {
     g_language = dglabLanguageResolve(g_settings.language, dglabFontSystemIsChinese());
     dglabStringsSetLanguage(g_language);
+
+    if (!g_framebuffer_ready) return;
 
     {
         const DglabFontSet* fonts =
@@ -190,6 +188,7 @@ static void appDisplaySuspend(void)
 {
     dglabFontClose();
     dglabFramebufferClose();
+    g_framebuffer_ready = false;
 }
 
 // Builds the framebuffer again, at whatever resolution the console is running
@@ -202,17 +201,22 @@ static void appDisplaySuspend(void)
 // the BLE PoC console used to do exactly that, and only a restart recovered.
 // The theme is applied again here too, which is the other half of "a rebuilt
 // display draws everything from scratch".
+
+#ifndef DGLAB_UI_BOREALIS
 static bool appDisplayReopen(void)
 {
     if (!dglabFramebufferOpen())
         return false;
 
+    g_framebuffer_ready = true;
     appLanguageApply();
     appThemeApply();
     g_display_generation++;
 
     return true;
 }
+
+#endif
 
 // The console tells us when it is docked or undocked; the callback only records
 // it, and the main loop rebuilds the display between frames.
@@ -320,10 +324,7 @@ static void logPushLine(DglabLogRing* ring, const char* line)
     if (ring->filled < DGLAB_SCREEN_LOG_LINES)
         ring->filled++;
 
-    if (g_log_file != NULL) {
-        fprintf(g_log_file, "%s\n", line);
-        fflush(g_log_file);
-    }
+    dglabLogFilePush(line);
 }
 
 // ---------------------------------------------------------------------------
@@ -396,6 +397,16 @@ static void logFileOpen(void)
 
     if (g_log_file == NULL)
         g_log_file = fopen("sdmc:/dglab-net.log", "w");
+    if (g_log_file != NULL) {
+        Result rc = dglabLogFileStart(g_log_file);
+        if (R_FAILED(rc)) {
+            fclose(g_log_file);
+            g_log_file = NULL;
+            char line[80];
+            snprintf(line, sizeof(line), "nro log writer start failed rc=0x%08X", (u32)rc);
+            logPushLine(&g_log_ble, line);
+        }
+    }
 }
 
 // Assembles the chunks of one source into lines and hands them to its ring. The
@@ -772,6 +783,7 @@ typedef struct {
     u32 display_generation;
 } DglabScreenSnapshot;
 
+#ifndef DGLAB_UI_BOREALIS
 static void snapshotFromState(DglabScreenSnapshot* out, const DglabScreenState* state)
 {
     memset(out, 0, sizeof(*out));
@@ -798,6 +810,8 @@ static void snapshotFromState(DglabScreenSnapshot* out, const DglabScreenState* 
     if (state->url)
         snprintf(out->url, sizeof(out->url), "%s", state->url);
 }
+
+#endif
 
 // How far the log page can scroll: the lines that do not fit the view.
 static int logMaxOffset(int log_count)
@@ -865,139 +879,6 @@ static int logScrollFromDirections(int offset, int max_offset, u64 down, u64 hel
 // (dglabChannelCeiling()). The loader itself lives with the gameplay modes below.
 static void motionSettingsLoad(DglabMotionFeedConfig* config);
 
-static void runSocketView(Service* dglab, PadState* pad)
-{
-    DglabScreenSnapshot snapshot;
-    bool have_snapshot = false;
-    // What the A button means here: whether the server held a socket as of this
-    // frame's status poll, which is also what the bottom bar's label says.
-    bool server_running = false;
-    char url[DGLAB_NET_QR_MAX];
-    bool url_ok = false;
-    // The log page is part of this view: Y opens it and closes it again, and it
-    // opens on the newest line, which is what a log is read for.
-    bool log_open = false;
-    int log_offset = 0;
-    u32 frame = 0;
-    // The channel limits from the parameters page: the fallback ceiling for the
-    // two strength rows while the App has not reported its own (see
-    // dglabChannelCeiling()).
-    DglabMotionFeedConfig config;
-
-    url[0] = '\0';
-    motionSettingsLoad(&config);
-
-    while (appletMainLoop()) {
-        DglabScreenState state;
-        DglabNetQrChunk chunk;
-        u64 down;
-        u64 held;
-
-        padUpdate(pad);
-        down = padGetButtonsDown(pad);
-        held = padGetButtons(pad);
-
-        memset(&state, 0, sizeof(state));
-        memset(&chunk, 0, sizeof(chunk));
-
-        state.url = url;
-        state.url_ok = url_ok;
-        state.sysmodule_ok = appSysmoduleOk(dglab);
-
-        state.status_ok =
-            R_SUCCEEDED(serviceDispatchOut(dglab, DGLAB_IPC_CMD_NET_STATUS, state.status));
-
-        // The log is the one thing that arrives continuously, and the file it is
-        // mirrored to does not care about 60Hz: polling every few frames keeps
-        // the IPC traffic down without a visible delay.
-        if (++frame % LOG_POLL_INTERVAL_FRAMES == 1) {
-            logPoll(dglab);
-            buildLogPointers(&g_log_net);
-        }
-
-        state.log_lines = g_log_net.pointers;
-        state.log_count = g_log_net.filled;
-
-        if (R_SUCCEEDED(serviceDispatchOut(dglab, DGLAB_IPC_CMD_NET_QR, chunk))) {
-            url_ok = true;
-            snprintf(url, sizeof(url), "%s", chunk.text);
-        } else {
-            // Without a LAN address there is no QR code to show.
-            url_ok = false;
-            url[0] = '\0';
-        }
-
-        state.url_ok = url_ok;
-        server_running = state.status_ok &&
-            (state.status.state == DglabNetState_Listening ||
-                state.status.state == DglabNetState_Paired);
-        appAutoSleepFollow(server_running);
-
-        // The ceiling the two strength rows show and the D-pad stops at: the
-        // App's own limit once it has reported one, the parameters page's
-        // channel limit until then. Both are recomputed from this frame's poll,
-        // so the screen and the keys can never disagree.
-        state.limit_a = dglabChannelCeiling(
-            state.status_ok && state.status.reports_received != 0, state.status.app_limit_a,
-            config.channel_limit_a);
-        state.limit_b = dglabChannelCeiling(
-            state.status_ok && state.status.reports_received != 0, state.status.app_limit_b,
-            config.channel_limit_b);
-        clampStrengthsToCeilings(dglab, state.limit_a, state.limit_b, true);
-
-        if (down & HidNpadButton_B)
-            return;
-
-        if (down & HidNpadButton_Y) {
-            log_open = !log_open;
-
-            if (log_open)
-                log_offset = logMaxOffset(g_log_net.filled);
-        } else if (log_open) {
-            log_offset = logScrollFromDirections(log_offset, logMaxOffset(g_log_net.filled), down,
-                held, armTicksToNs(armGetSystemTick()));
-        } else {
-            if (down & HidNpadButton_A)
-                toggleServer(dglab, server_running);
-
-            testChannelButtons(dglab, down);
-            adjustStrengthFromDirections(dglab, down, state.limit_a, state.limit_b);
-            repeatStrengthFromDirections(dglab, held, armTicksToNs(armGetSystemTick()),
-                state.limit_a, state.limit_b);
-        }
-
-        state.log_open = log_open;
-        state.log_offset = log_offset;
-
-        // Read after the buttons are handled, so a press shows up in the same
-        // frame it happened.
-        state.test_strength_a = g_test_strength_a;
-        state.test_strength_b = g_test_strength_b;
-        state.last_command = g_last_command;
-        state.last_command_tone = g_last_command_tone;
-        // Which of the two warning lines the server row carries. It follows the
-        // flag this frame's poll set, which is one frame behind a press - the
-        // same lag the status row above already has.
-        state.auto_sleep_suppressed = dglabAutoSleepActive();
-
-        DglabScreenSnapshot candidate;
-
-        snapshotFromState(&candidate, &state);
-
-        if (!have_snapshot || memcmp(&candidate, &snapshot, sizeof(candidate)) != 0) {
-            DglabCanvas canvas;
-
-            if (dglabFramebufferBegin(&canvas)) {
-                dglabScreenDraw(&canvas, &g_fonts, &state);
-                dglabFramebufferEnd();
-
-                snapshot = candidate;
-                have_snapshot = true;
-            }
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // The menu
 // ---------------------------------------------------------------------------
@@ -1005,6 +886,7 @@ static void runSocketView(Service* dglab, PadState* pad)
 // Kept across visits, so leaving a mode comes back to the same entry.
 static unsigned g_menu_selected = DglabMenu_ItemSocket;
 
+#ifndef DGLAB_UI_BOREALIS
 static DglabMenuResult runMenuView(Service* dglab, PadState* pad)
 {
     DglabMenuState state;
@@ -1042,7 +924,6 @@ static DglabMenuResult runMenuView(Service* dglab, PadState* pad)
                 case DglabMenu_ItemTouch: return DglabMenuResult_Touch;
                 case DglabMenu_ItemAdvanced: return DglabMenuResult_Advanced;
                 case DglabMenu_ItemAbout: return DglabMenuResult_About;
-                case DglabMenu_ItemBlePoc: return DglabMenuResult_BlePoc;
                 default: return DglabMenuResult_Socket;
             }
         }
@@ -1074,6 +955,8 @@ static DglabMenuResult runMenuView(Service* dglab, PadState* pad)
 
     return DglabMenuResult_Exit;
 }
+
+#endif
 
 // ---------------------------------------------------------------------------
 // The motion mode
@@ -1157,298 +1040,6 @@ static Result uploadSlots(Service* dglab, u32 channel, const DglabNetWaveformSlo
     return serviceDispatchIn(dglab, DGLAB_IPC_CMD_NET_WAVEFORM, request);
 }
 
-static void runMotionView(Service* dglab, PadState* pad)
-{
-    DglabMotionFeedConfig config;
-    DglabMotionFeed feed_a;
-    DglabMotionFeed feed_b;
-    DglabMotionScreenState state;
-    DglabNetWaveformSlot slots[DGLAB_NET_WAVEFORM_MAX_SLOTS];
-    u64 last_ticks;
-    u32 frame = 0;
-    u32 drawn_generation = 0;
-    bool described = false;
-    // The connection the row is showing, so only a change writes a log line. The
-    // first poll fills them in without logging: the describe line above already
-    // carries the state the mode started in.
-    bool link_known = false;
-    bool left_connected = false;
-    bool right_connected = false;
-    // The pad's own report for this frame, kept for the log line below.
-    u32 pad_device = 0;
-    u32 pad_styles = 0;
-    u32 pad_attributes = 0;
-    bool pad_handheld = false;
-
-    motionSettingsLoad(&config);
-    dglabMotionFeedInit(&feed_a, &config);
-    dglabMotionFeedInit(&feed_b, &config);
-
-    memset(&state, 0, sizeof(state));
-    state.link = dglabString(DglabString_StateNotStarted);
-    state.last_upload = "";
-
-    // Whatever the test buttons left queued should not play underneath the
-    // motion stream.
-    noteCommand(dglabString(DglabString_CmdClear), sendTestCommand(dglab, DglabNetCommand_Clear, 0, 0), NULL);
-
-    dglabJoyconStart();
-
-    last_ticks = armGetSystemTick();
-
-    while (appletMainLoop()) {
-        DglabMotionSample samples[MOTION_DRAIN_MAX];
-        u32 elapsed_ns;
-        u64 now;
-        u64 down;
-
-        now = armGetSystemTick();
-        elapsed_ns = (u32)armTicksToNs(now - last_ticks);
-        last_ticks = now;
-
-        padUpdate(pad);
-        down = padGetButtonsDown(pad);
-
-        // The server state is asked for every frame, not only when the panel is
-        // rebuilt: A starts and stops from what this frame saw, and the bottom
-        // bar's label comes from the same pass - the key and the label cannot
-        // disagree. The panel still refreshes at its own rate below.
-        {
-            DglabNetStatus status;
-            bool status_ok;
-
-            memset(&status, 0, sizeof(status));
-            status_ok = R_SUCCEEDED(
-                serviceDispatchOut(dglab, DGLAB_IPC_CMD_NET_STATUS, status));
-            state.server_running = status_ok &&
-                (status.state == DglabNetState_Listening ||
-                    status.state == DglabNetState_Paired);
-
-            // The ceiling the two strength rows show and the D-pad stops at: the
-            // App's own limit while it reports one, the parameters page's
-            // channel limit otherwise (dglabChannelCeiling()).
-            state.limit_a = dglabChannelCeiling(status_ok && status.reports_received != 0,
-                status.app_limit_a, config.channel_limit_a);
-            state.limit_b = dglabChannelCeiling(status_ok && status.reports_received != 0,
-                status.app_limit_b, config.channel_limit_b);
-
-            // The motion page is the other place the server can be started, so
-            // it has to keep the console's sleep timer in step with it too.
-            appAutoSleepFollow(state.server_running);
-
-            // A BLE session drives the device locally (the sysmodule routes
-            // NET_SEND / NET_WAVEFORM to it while it is active), and it outlives
-            // the page that started it: while one runs, this row says so instead
-            // of showing the socket server's state, which is not what the packets
-            // this page sends end up driving.
-            if (appBleSessionActive(dglab)) {
-                state.link = dglabString(DglabString_BleTitle);
-                state.link_tone = DglabCmdTone_Ok;
-            } else if (!status_ok) {
-                state.link = dglabString(DglabString_StateIpcFailed);
-                state.link_tone = DglabCmdTone_Error;
-            } else {
-                state.link = dglabNetStateText(status.state);
-                state.link_tone = (status.state == DglabNetState_Paired) ? DglabCmdTone_Ok
-                                                                        : DglabCmdTone_Warn;
-            }
-        }
-
-        if (down & HidNpadButton_B)
-            break;
-
-        // The same shortcuts as the socket page: A starts and stops the server,
-        // X clears what a test left playing, ZL and ZR fire one channel each,
-        // and the D-pad dials the two channel strengths (up/down A, left/right
-        // B). Nothing is focused here, so the D-pad has no other job.
-        if (down & HidNpadButton_A)
-            toggleServer(dglab, state.server_running);
-
-        // Y takes a fresh set of sensor handles. The mode's handles describe the
-        // assignment the console had when they were taken, so a Joy-Con that was
-        // turned off or plugged back in keeps its row on "not connected" until
-        // they are taken again - this is that, without leaving the page.
-        if (down & HidNpadButton_Y) {
-            dglabJoyconRescan();
-            logPushLine(&g_log_net, "motion rescan (Y)");
-        }
-
-        testChannelButtons(dglab, down);
-        clampStrengthsToCeilings(dglab, state.limit_a, state.limit_b, true);
-        adjustStrengthFromDirections(dglab, down, state.limit_a, state.limit_b);
-        repeatStrengthFromDirections(dglab, padGetButtons(pad),
-            armTicksToNs(armGetSystemTick()), state.limit_a, state.limit_b);
-
-        // Which sides this mode can read at all, from the pad the buttons come
-        // from: the six-axis handles keep handing over readings for a Joy-Con
-        // that is attached to the console or switched off, so they are not a
-        // connection signal (hardware report, 2026-09-17 - and the reason the two
-        // rows never went back to 未连接). `padIsHandheld` covers "plugged back
-        // in", the two attribute bits cover "switched off / not there".
-        {
-            // The per-side answer, when the console gives one: JoyLeft/JoyRight
-            // mean the controller is detached and usable as this mode's input,
-            // HandheldLeft/Right mean it is clipped onto the console (moving it
-            // moves the console, which is not this mode), and a bit that is clear
-            // means that side is switched off or gone.
-            u32 device = hidGetNpadDeviceType(HidNpadIdType_No1);
-            u32 styles = padGetStyleSet(pad);
-            u32 attributes = padGetAttributes(pad);
-            bool handheld = padIsHandheld(pad);
-            bool left_ok;
-            bool right_ok;
-
-            if (device != 0) {
-                left_ok = (device & HidDeviceTypeBits_JoyLeft) != 0;
-                right_ok = (device & HidDeviceTypeBits_JoyRight) != 0;
-            } else if (styles != 0 || (attributes & HidNpadAttribute_IsConnected) != 0) {
-                // No device type: the pad state the buttons come from still says
-                // whether the console is handheld and which halves are there.
-                left_ok = !handheld &&
-                    (styles & (HidNpadStyleTag_NpadJoyDual | HidNpadStyleTag_NpadJoyLeft)) != 0 &&
-                    (attributes & HidNpadAttribute_IsLeftConnected) != 0;
-                right_ok = !handheld &&
-                    (styles & (HidNpadStyleTag_NpadJoyDual | HidNpadStyleTag_NpadJoyRight)) != 0 &&
-                    (attributes & HidNpadAttribute_IsRightConnected) != 0;
-            } else {
-                // Nothing is answering, not even the pad: keep the old behaviour,
-                // which judges each side by its readings alone.
-                left_ok = true;
-                right_ok = true;
-            }
-
-            pad_device = device;
-            pad_styles = styles;
-            pad_attributes = attributes;
-            pad_handheld = handheld;
-
-            // Drain both sides every frame: the sensors run faster than this
-            // loop, and a reading that is not collected now is gone.
-            for (size_t i = 0, count = dglabJoyconPoll(DglabJoycon_Left, samples,
-                     MOTION_DRAIN_MAX, left_ok); i < count; i++)
-                dglabMotionFeedAddSample(&feed_a, &samples[i]);
-
-            for (size_t i = 0, count = dglabJoyconPoll(DglabJoycon_Right, samples,
-                     MOTION_DRAIN_MAX, right_ok); i < count; i++)
-                dglabMotionFeedAddSample(&feed_b, &samples[i]);
-
-        }
-
-        // One line about the sensor handles, once per visit (the log page shows
-        // it, and the whole line goes to the file on the SD card). Which handles
-        // a console hands over, and which of them answer, is a hardware fact:
-        // this is what makes "the row says not connected while the waveform
-        // plays" answerable from a log instead of a guess.
-        if (!described) {
-            char left[160];
-            char right[160];
-            char line[448];
-
-            described = true;
-            dglabJoyconDescribe(DglabJoycon_Left, left, sizeof(left));
-            dglabJoyconDescribe(DglabJoycon_Right, right, sizeof(right));
-            snprintf(line, sizeof(line),
-                "motion device 0x%08X styles 0x%08X attrs 0x%08X handheld %u | %s | %s",
-                (unsigned)pad_device, (unsigned)pad_styles, (unsigned)pad_attributes,
-                pad_handheld ? 1u : 0u, left, right);
-            logPushLine(&g_log_net, line);
-        }
-
-        // A side going away or coming back is worth a line of its own: whether a
-        // sleeping or removed Joy-Con really clears IsConnected is one of the
-        // things only hardware can answer (docs/joycon-input.md), and it is the
-        // state the row is about. Only changes are logged, so a still session
-        // writes nothing.
-        {
-            bool left_now = dglabJoyconIsConnected(DglabJoycon_Left);
-            bool right_now = dglabJoyconIsConnected(DglabJoycon_Right);
-
-            if (link_known) {
-                // The line carries the side's own description, so a change in the
-                // log says *why* it happened: which handle answered, how long the
-                // side had been quiet, whether it had just re-acquired a set.
-                if (left_now != left_connected) {
-                    char detail[160];
-                    char line[224];
-
-                    dglabJoyconDescribe(DglabJoycon_Left, detail, sizeof(detail));
-                    snprintf(line, sizeof(line), "motion left %s: %s",
-                        left_now ? "connected" : "disconnected", detail);
-                    logPushLine(&g_log_net, line);
-                }
-
-                if (right_now != right_connected) {
-                    char detail[160];
-                    char line[224];
-
-                    dglabJoyconDescribe(DglabJoycon_Right, detail, sizeof(detail));
-                    snprintf(line, sizeof(line), "motion right %s: %s",
-                        right_now ? "connected" : "disconnected", detail);
-                    logPushLine(&g_log_net, line);
-                }
-            }
-
-            left_connected = left_now;
-            right_connected = right_now;
-            link_known = true;
-        }
-
-        // A batch that is all silence is dropped instead of uploaded: that is
-        // what makes a still controller cost no traffic at all.
-        {
-            size_t produced = dglabMotionFeedAdvance(&feed_a, elapsed_ns, slots,
-                DGLAB_NET_WAVEFORM_MAX_SLOTS);
-
-            if (produced > 0 && slotsHaveStrength(slots, produced))
-                noteCommand(dglabString(DglabString_CmdWaveformA),
-                    uploadSlots(dglab, MOTION_CHANNEL_A, slots, produced), NULL);
-        }
-
-        {
-            size_t produced = dglabMotionFeedAdvance(&feed_b, elapsed_ns, slots,
-                DGLAB_NET_WAVEFORM_MAX_SLOTS);
-
-            if (produced > 0 && slotsHaveStrength(slots, produced))
-                noteCommand(dglabString(DglabString_CmdWaveformB),
-                    uploadSlots(dglab, MOTION_CHANNEL_B, slots, produced), NULL);
-        }
-
-        // The header's status is asked for every frame (the shared poll is what
-        // paces the PING); the live values below refresh a few times a second,
-        // and a rebuilt display is drawn at once, whatever that counter says.
-        state.sysmodule_ok = appSysmoduleOk(dglab);
-
-        if (++frame % MOTION_DISPLAY_FRAMES == 1 || drawn_generation != g_display_generation) {
-            DglabCanvas canvas;
-
-            state.left_connected = dglabJoyconIsConnected(DglabJoycon_Left);
-            state.right_connected = dglabJoyconIsConnected(DglabJoycon_Right);
-            state.moving_a = dglabMotionFeedIsMoving(&feed_a);
-            state.moving_b = dglabMotionFeedIsMoving(&feed_b);
-            state.level_a = (unsigned)(dglabMotionFeedLevel(&feed_a) * 100.0f + 0.5f);
-            state.level_b = (unsigned)(dglabMotionFeedLevel(&feed_b) * 100.0f + 0.5f);
-            state.frequency_a = dglabMotionFeedFrequencyMs(&feed_a);
-            state.frequency_b = dglabMotionFeedFrequencyMs(&feed_b);
-            state.channel_strength_a = g_test_strength_a;
-            state.channel_strength_b = g_test_strength_b;
-            state.last_upload = g_last_command;
-            state.last_upload_tone = g_last_command_tone;
-
-            if (dglabFramebufferBegin(&canvas)) {
-                dglabMotionScreenDraw(&canvas, &g_fonts, &state);
-                dglabFramebufferEnd();
-
-                drawn_generation = g_display_generation;
-            }
-        }
-    }
-
-    // Stop the stream before leaving: the sensors go quiet and the queued
-    // waveform is cleared, so nothing keeps playing from the menu.
-    dglabJoyconStop();
-    noteCommand(dglabString(DglabString_CmdClear), sendTestCommand(dglab, DglabNetCommand_Clear, 0, 0), NULL);
-}
-
 // ---------------------------------------------------------------------------
 // The touch mode
 // ---------------------------------------------------------------------------
@@ -1494,218 +1085,6 @@ static void touchLogLine(const char* tag)
     logPushLine(&g_log_net, line);
 }
 
-static void runTouchView(Service* dglab, PadState* pad)
-{
-    DglabMotionFeedConfig config;
-    DglabTouchFeed touch_feed;
-    DglabMotionFeed stream[DglabTouchChannelValue_Count];
-    DglabTouchScreenState state;
-    DglabNetWaveformSlot slots[DGLAB_NET_WAVEFORM_MAX_SLOTS];
-    u64 last_ticks;
-    u32 frame = 0;
-    u32 drawn_generation = 0;
-    bool described = false;
-    bool have_last = false;
-    bool last_held_a = false;
-    bool last_held_b = false;
-
-    // Entering the mode is what initializes the panel: nothing else in this NRO
-    // touches it (nro/AGENTS.md). libnx has no error to report here - a refusal
-    // is its fatal error page - which is why the log's first line is the answer
-    // the probe run exists for.
-    dglabTouchStart();
-
-    // One parameter file for both modes (docs/touch-input.md): the envelope, the
-    // idle stop, the two frequency ends and the strength ceiling are the numbers
-    // the Advanced page edits for the motion mode. The one thing this mode decides
-    // for itself is that its density is the panel's horizontal axis and not its
-    // level.
-    motionSettingsLoad(&config);
-    config.frequency_follows_level = false;
-
-    for (unsigned channel = 0; channel < (unsigned)DglabTouchChannelValue_Count; channel++)
-        dglabMotionFeedInit(&stream[channel], &config);
-
-    dglabTouchFeedInit(&touch_feed);
-
-    memset(&state, 0, sizeof(state));
-    state.link = dglabString(DglabString_StateNotStarted);
-    state.last_upload = "";
-    // The density switch is a parameter rather than a per-frame value: the page
-    // only needs it to know whether there is a horizontal axis worth drawing.
-    state.density_fixed = config.density_fixed;
-
-    // Whatever the test buttons left queued should not play underneath the mode.
-    noteCommand(dglabString(DglabString_CmdClear), sendTestCommand(dglab, DglabNetCommand_Clear, 0, 0), NULL);
-
-    last_ticks = armGetSystemTick();
-
-    while (appletMainLoop()) {
-        DglabTouchFrame readings;
-        u32 elapsed_ns;
-        u64 now;
-        u64 down;
-
-        // The slots stay paced by time rather than by frames, like the motion
-        // mode's: a slow frame produces several of them at once.
-        now = armGetSystemTick();
-        elapsed_ns = (u32)armTicksToNs(now - last_ticks);
-        last_ticks = now;
-
-        padUpdate(pad);
-        down = padGetButtonsDown(pad);
-
-        // The same server poll and shortcuts as the socket and motion pages: A
-        // starts and stops the server, X clears, ZL and ZR fire one channel, and
-        // the D-pad dials the two channel strengths.
-        {
-            DglabNetStatus status;
-            bool status_ok;
-
-            memset(&status, 0, sizeof(status));
-            status_ok = R_SUCCEEDED(
-                serviceDispatchOut(dglab, DGLAB_IPC_CMD_NET_STATUS, status));
-            state.server_running = status_ok &&
-                (status.state == DglabNetState_Listening ||
-                    status.state == DglabNetState_Paired);
-
-            appAutoSleepFollow(state.server_running);
-
-            // The ceiling rule is the socket and motion pages' one: the App's own
-            // limit while it reports one, the parameters page's otherwise.
-            state.limit_a = dglabChannelCeiling(status_ok && status.reports_received != 0,
-                status.app_limit_a, config.channel_limit_a);
-            state.limit_b = dglabChannelCeiling(status_ok && status.reports_received != 0,
-                status.app_limit_b, config.channel_limit_b);
-
-            // Same as the motion page: while a BLE session runs, that is what the
-            // touch panel's packets drive.
-            if (appBleSessionActive(dglab)) {
-                state.link = dglabString(DglabString_BleTitle);
-                state.link_tone = DglabCmdTone_Ok;
-            } else if (!status_ok) {
-                state.link = dglabString(DglabString_StateIpcFailed);
-                state.link_tone = DglabCmdTone_Error;
-            } else {
-                state.link = dglabNetStateText(status.state);
-                state.link_tone = (status.state == DglabNetState_Paired) ? DglabCmdTone_Ok
-                                                                        : DglabCmdTone_Warn;
-            }
-        }
-
-        if (down & HidNpadButton_B)
-            break;
-
-        if (down & HidNpadButton_A)
-            toggleServer(dglab, state.server_running);
-
-        testChannelButtons(dglab, down);
-        clampStrengthsToCeilings(dglab, state.limit_a, state.limit_b, true);
-        adjustStrengthFromDirections(dglab, down, state.limit_a, state.limit_b);
-        repeatStrengthFromDirections(dglab, padGetButtons(pad),
-            armTicksToNs(armGetSystemTick()), state.limit_a, state.limit_b);
-
-        // The panel, then the mapping, then the slots: the same three steps the
-        // motion mode takes with a sensor sample, which is what lets the two modes
-        // share the envelope, the idle stop and the parameters.
-        dglabTouchPoll(&readings);
-        dglabTouchFeedUpdate(&touch_feed, &readings);
-
-        for (unsigned channel = 0; channel < (unsigned)DglabTouchChannelValue_Count; channel++) {
-            const DglabTouchChannelState* target = dglabTouchFeedChannel(&touch_feed, channel);
-
-            if (target->held)
-                dglabMotionFeedSetTarget(&stream[channel], target->level, target->density);
-        }
-
-        // An all-zero batch is not uploaded, which is the rule the motion mode
-        // already works by: a finger held on the bottom rule, and everything after
-        // a release has decayed, costs no traffic at all.
-        for (unsigned channel = 0; channel < (unsigned)DglabTouchChannelValue_Count; channel++) {
-            size_t produced = dglabMotionFeedAdvance(&stream[channel], elapsed_ns, slots,
-                DGLAB_NET_WAVEFORM_MAX_SLOTS);
-
-            if (produced > 0 && slotsHaveStrength(slots, produced))
-                noteCommand(dglabString(touchChannelCommand(channel)),
-                    uploadSlots(dglab, touchChannelNumber(channel), slots, produced), NULL);
-        }
-
-        {
-            const DglabTouchChannelState* a =
-                dglabTouchFeedChannel(&touch_feed, DglabTouchChannelValue_A);
-            const DglabTouchChannelState* b =
-                dglabTouchFeedChannel(&touch_feed, DglabTouchChannelValue_B);
-
-            state.held_a = a->held;
-            state.x_a = a->x;
-            state.y_a = a->y;
-            state.level_a = (unsigned)(dglabMotionFeedLevel(&stream[DglabTouchChannelValue_A]) *
-                                       100.0f + 0.5f);
-            state.frequency_a = dglabMotionFeedFrequencyMs(&stream[DglabTouchChannelValue_A]);
-
-            state.held_b = b->held;
-            state.x_b = b->x;
-            state.y_b = b->y;
-            state.level_b = (unsigned)(dglabMotionFeedLevel(&stream[DglabTouchChannelValue_B]) *
-                                       100.0f + 0.5f);
-            state.frequency_b = dglabMotionFeedFrequencyMs(&stream[DglabTouchChannelValue_B]);
-        }
-
-        state.docked = !dglabTouchHandheld();
-
-        // One line at the start and one per change of which halves have a finger:
-        // the log then holds the whole session - the LIFO depth the panel answered
-        // with, the coordinates, and what the mode made of them.
-        if (!described) {
-            described = true;
-            touchLogLine("start");
-        } else if (!have_last || state.held_a != last_held_a || state.held_b != last_held_b) {
-            char tag[80];
-
-            if (state.held_a && state.held_b) {
-                snprintf(tag, sizeof(tag), "both A %u/%ums B %u/%ums", state.level_a,
-                    state.frequency_a, state.level_b, state.frequency_b);
-            } else if (state.held_a) {
-                snprintf(tag, sizeof(tag), "A %u/%ums", state.level_a, state.frequency_a);
-            } else if (state.held_b) {
-                snprintf(tag, sizeof(tag), "B %u/%ums", state.level_b, state.frequency_b);
-            } else {
-                snprintf(tag, sizeof(tag), "none");
-            }
-
-            touchLogLine(tag);
-        }
-
-        last_held_a = state.held_a;
-        last_held_b = state.held_b;
-        have_last = true;
-
-        state.sysmodule_ok = appSysmoduleOk(dglab);
-
-        if (frame % TOUCH_DISPLAY_FRAMES == 0 || drawn_generation != g_display_generation) {
-            DglabCanvas canvas;
-
-            state.channel_strength_a = g_test_strength_a;
-            state.channel_strength_b = g_test_strength_b;
-            state.last_upload = g_last_command;
-            state.last_upload_tone = g_last_command_tone;
-
-            if (dglabFramebufferBegin(&canvas)) {
-                dglabTouchScreenDraw(&canvas, &g_fonts, &state);
-                dglabFramebufferEnd();
-
-                drawn_generation = g_display_generation;
-            }
-        }
-
-        frame++;
-    }
-
-    // Leaving the mode clears what the mode and the test keys may have left
-    // playing, the same way the motion mode does.
-    noteCommand(dglabString(DglabString_CmdClear), sendTestCommand(dglab, DglabNetCommand_Clear, 0, 0), NULL);
-}
-
 // Error path: the console is used instead of the framebuffer, because it is the
 // rendering path that is known to work on real hardware. Without the sysmodule
 // there is nothing to draw anyway, and an empty window tells the user nothing.
@@ -1731,6 +1110,17 @@ static void bleLogFailure(const char* what, Result rc)
     logPushLine(&g_log_ble, line);
 }
 
+static void bleLogCallTiming(const char* call, u64 started)
+{
+    u64 elapsed_ms = armTicksToNs(armGetSystemTick() - started) / 1000000ull;
+    if (elapsed_ms >= 100u) {
+        char line[96];
+        snprintf(line, sizeof(line), "nro BLE: %s took %llu ms", call,
+            (unsigned long long)elapsed_ms);
+        logPushLine(&g_log_ble, line);
+    }
+}
+
 // The BLE session logs into the sysmodule's PoC ring, and only the front end can
 // drain that ring to the SD card. This page does it for the session (the PoC
 // console page does it for the probe experiments); otherwise a failed connect
@@ -1747,7 +1137,9 @@ static void bleLogPoll(Service* dglab)
         request.cursor = g_log_ble.cursor;
         memset(&chunk, 0, sizeof(chunk));
 
+        u64 started = armGetSystemTick();
         rc = serviceDispatchInOut(dglab, DGLAB_IPC_POC_CMD_LOG, request, chunk);
+        bleLogCallTiming("POC_LOG", started);
         if (R_FAILED(rc))
             return;
 
@@ -1852,203 +1244,28 @@ static void blePushLimits(Service* dglab, u32 limit_a, u32 limit_b)
     }
 }
 
-static void runBleView(Service* dglab, PadState* pad)
+static void appPageTrace(const char* event, DglabMenuResult page, u64 elapsed)
 {
-    DglabBlePageState state;
-    DglabBlePageState drawn;
-    bool have_drawn = false;
-    u32 drawn_generation = 0;
-    u32 drawn_log_generation = 0;
-    DglabMotionFeedConfig config;
-
-    memset(&state, 0, sizeof(state));
-    memset(&drawn, 0, sizeof(drawn));
-
-    // Read once, when the page opens: the ceilings are not adjustable from here
-    // (see above). A session that is already running keeps the pair it was given,
-    // and the frame loop below decides which of the two the rows show.
-    motionSettingsLoad(&config);
-
-    while (appletMainLoop()) {
-        DglabCanvas canvas;
-        DglabBleStatus status;
-        DglabPocStatus poc_status;
-        Result status_rc;
-        u64 down;
-        u64 held;
-
-        padUpdate(pad);
-        down = padGetButtonsDown(pad);
-        held = padGetButtons(pad);
-
-        // The session's own log goes to the card while this page is open, so a
-        // failed connect can be read back instead of only seen on screen. The
-        // same ring is what Y shows (the sysmodule log page's layout, with this
-        // session's title).
-        bleLogPoll(dglab);
-        buildLogPointers(&g_log_ble);
-
-        // B leaves the page and nothing else: the session keeps running, which is
-        // what lets the gameplay pages drive the device (see the header comment).
-        // X, below, is the stop key.
-        if (down & HidNpadButton_B)
-            return;
-
-        if (down & HidNpadButton_Y) {
-            state.log_open = !state.log_open;
-
-            if (state.log_open)
-                state.log_offset = logMaxOffset(g_log_ble.filled);
-        } else if (state.log_open) {
-            state.log_offset = logScrollFromDirections(state.log_offset,
-                logMaxOffset(g_log_ble.filled), down, held, armTicksToNs(armGetSystemTick()));
-        } else {
-            // The mixer, the same two helpers the socket and motion pages call:
-            // up/down dial channel A, left/right channel B, one step per press
-            // and a walk while held. A running session follows them because the
-            // sysmodule routes NET_SEND to it while it is active.
-            adjustStrengthFromDirections(dglab, down, state.limit_a, state.limit_b);
-            repeatStrengthFromDirections(dglab, held, armTicksToNs(armGetSystemTick()),
-                state.limit_a, state.limit_b);
-
-            if (down & HidNpadButton_X)
-                serviceDispatch(dglab, DGLAB_IPC_CMD_BLE_STOP);
-        }
-
-        if ((down & HidNpadButton_A) && !state.log_open && !state.starting &&
-            !bleStateIsActive(state.status.state)) {
-            u8 address[6];
-
-            if (loadBleAddress(address)) {
-                DglabPocStartRequest request = { 0 };
-                DglabPocActionRequest action = { .action = DglabPocAction_ProbeBtdrvScan };
-                Result rc;
-
-                request.flags = DGLAB_POC_START_FLAG_TARGET_ADDRESS;
-                memcpy(request.target_address, address, sizeof(request.target_address));
-                memcpy(state.status.address, address, sizeof(state.status.address));
-
-                rc = serviceDispatchIn(dglab, DGLAB_IPC_POC_CMD_START, request);
-                bleLogFailure("driver probe start", rc);
-
-                if (R_SUCCEEDED(rc)) {
-                    rc = serviceDispatchIn(dglab, DGLAB_IPC_POC_CMD_ACTION, action);
-                    bleLogFailure("driver probe action", rc);
-                }
-
-                if (R_SUCCEEDED(rc))
-                    state.starting = true;
-            }
-        }
-
-        memset(&status, 0, sizeof(status));
-        status_rc = serviceDispatchOut(dglab, DGLAB_IPC_CMD_BLE_STATUS, status);
-        state.sysmodule_ok = R_SUCCEEDED(status_rc);
-
-        if (R_SUCCEEDED(status_rc)) {
-            u8 address[6];
-
-            memcpy(address, state.status.address, sizeof(address));
-            state.status = status;
-            memcpy(state.status.address, address, sizeof(address));
-        }
-
-        // Step 1 of the start sequence: wait for the driver-level session to
-        // finish, then send step 2. The PoC status is the only place that says
-        // whether a session is still running.
-        if (state.starting) {
-            u8 address[6];
-
-            memset(&poc_status, 0, sizeof(poc_status));
-            state.driver_running = R_SUCCEEDED(
-                serviceDispatchOut(dglab, DGLAB_IPC_POC_CMD_STATUS, poc_status)) &&
-                poc_status.state == DglabPocState_Initializing;
-
-            if (!state.driver_running && loadBleAddress(address)) {
-                DglabBleStartRequest request = { 0 };
-                Result rc;
-
-                state.starting = false;
-                request.limit_a = state.limit_a;
-                request.limit_b = state.limit_b;
-                memcpy(request.address, address, sizeof(request.address));
-                memcpy(state.status.address, address, sizeof(state.status.address));
-                rc = serviceDispatchIn(dglab, DGLAB_IPC_CMD_BLE_START, request);
-                bleLogFailure("ble session start", rc);
-
-                // The session is being told this pair, so that is the pair the
-                // rows show and the frame loop compares against (no need to push
-                // it again the moment the session reports itself as connecting).
-                if (R_SUCCEEDED(rc)) {
-                    g_ble_limits_known = true;
-                    g_ble_limit_a = request.limit_a;
-                    g_ble_limit_b = request.limit_b;
-                }
-            }
-        }
-
-        // Which ceilings the rows show, and what a ceiling changed in the
-        // parameters page does to a session that is already running: the pair is
-        // pushed into it (BLE_LIMIT), so "the settings page says 30" and "the
-        // device is capped at 30" stay the same statement. With nothing running
-        // the pair is simply the file.
-        if (bleStateIsActive(state.status.state)) {
-            if (!g_ble_limits_known) {
-                g_ble_limits_known = true;
-                g_ble_limit_a = config.channel_limit_a;
-                g_ble_limit_b = config.channel_limit_b;
-            } else if (g_ble_limit_a != config.channel_limit_a ||
-                g_ble_limit_b != config.channel_limit_b) {
-                blePushLimits(dglab, config.channel_limit_a, config.channel_limit_b);
-            }
-        } else {
-            g_ble_limits_known = false;
-        }
-
-        state.limit_a = g_ble_limits_known ? g_ble_limit_a : config.channel_limit_a;
-        state.limit_b = g_ble_limits_known ? g_ble_limit_b : config.channel_limit_b;
-
-        // The two rows the D-pad dials come from the same pair the socket and
-        // motion pages show, so the number on screen and the number that went out
-        // cannot be two different things. The page does not scroll (up and down
-        // are channel A here), so there is no offset to clamp.
-        clampStrengthsToCeilings(dglab, state.limit_a, state.limit_b, false);
-        state.strength_a = g_test_strength_a;
-        state.strength_b = g_test_strength_b;
-
-        if (have_drawn && memcmp(&drawn, &state, sizeof(state)) == 0 &&
-            drawn_generation == g_display_generation &&
-            drawn_log_generation == g_log_ble.generation)
-            continue;
-
-        if (dglabFramebufferBegin(&canvas)) {
-            if (state.log_open) {
-                DglabLogPage log;
-
-                log.title = dglabString(DglabString_BleLogTitle);
-                log.lines = g_log_ble.pointers;
-                log.count = g_log_ble.filled;
-                log.offset = state.log_offset;
-                log.sysmodule_ok = state.sysmodule_ok;
-                dglabLogPageDraw(&canvas, &g_fonts, &log);
-            } else {
-                dglabBleDraw(&canvas, &g_fonts, &state);
-            }
-
-            dglabFramebufferEnd();
-
-            drawn = state;
-            drawn_generation = g_display_generation;
-            drawn_log_generation = g_log_ble.generation;
-            have_drawn = true;
-        }
-    }
+    u64 used = 0;
+    Result rc = svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+    char line[192];
+#ifdef DGLAB_UI_BOREALIS
+    const char* backend = "borealis";
+#else
+    const char* backend = "framebuffer";
+#endif
+    snprintf(line, sizeof(line), "ui %s page=%u %s ns=%llu used_bytes=%llu memory_rc=0x%08X",
+        backend, (unsigned)page, event, (unsigned long long)elapsed, (unsigned long long)used, rc);
+    logPushLine(&g_log_net, line);
 }
+
+#include "pages/controller.inc"
 
 // ---------------------------------------------------------------------------
 // The about screen
 // ---------------------------------------------------------------------------
 
+#ifndef DGLAB_UI_BOREALIS
 static void runAboutView(Service* dglab, PadState* pad)
 {
     DglabIpcVersion version = { 0 };
@@ -2118,7 +1335,7 @@ static void runAboutView(Service* dglab, PadState* pad)
         state.app_version = DGLAB_APP_VERSION;
         state.build_id = DGLAB_BUILD_STAMP;
         state.ipc_version = version;
-        state.github_url = "https://github.com/livcm/DGLAB-NX";
+        state.github_url = "https://github.com/Aneko-QhJ/DGLAB-NX";
         state.sysmodule_ok = appSysmoduleOk(dglab);
 
         offset += step;
@@ -2263,6 +1480,8 @@ static void runAdvancedView(Service* dglab, PadState* pad)
         }
     }
 }
+#endif
+
 static void showNotice(PadState* pad, const char* headline, ...)
 {
     va_list args;
@@ -2319,6 +1538,43 @@ static void showStartupNotice(PadState* pad, const char* text)
     consoleExit(NULL);
 }
 
+#ifdef DGLAB_UI_BOREALIS
+static Service* g_native_service;
+static void nativeLog(const char* line) { logPushLine(&g_log_net, line); }
+static bool nativeIsDark(void) {
+    return dglabThemeResolve(g_settings.theme, g_system_is_dark) == &dglabThemeDark;
+}
+static void nativeCycleLanguage(void) {
+    g_settings.language = dglabLanguageNext(g_settings.language);
+    appSettingsSave(); appLanguageApply();
+}
+static void nativeCycleTheme(void) {
+    g_settings.theme = dglabThemeModeNext(g_settings.theme);
+    appSettingsSave(); appThemeApply();
+}
+static void nativeAboutState(DglabAboutState* state) {
+    memset(state, 0, sizeof(*state));
+    state->preference = g_settings.language;
+    state->resolved = g_language;
+    state->theme = g_settings.theme;
+    state->theme_system_is_dark = g_system_is_dark;
+    state->app_version = DGLAB_APP_VERSION;
+    state->build_id = DGLAB_BUILD_STAMP;
+    state->github_url = "https://github.com/Aneko-QhJ/DGLAB-NX";
+    serviceDispatchOut(g_native_service, DGLAB_IPC_CMD_GET_VERSION, state->ipc_version);
+}
+static void nativePoll(void) {
+    static u32 frames;
+    if (frames++ % LOG_POLL_INTERVAL_FRAMES == 0) {
+        logPoll(g_native_service);
+        bleLogPoll(g_native_service);
+        DglabNetStatus status = {0};
+        if (R_SUCCEEDED(serviceDispatchOut(g_native_service, DGLAB_IPC_CMD_NET_STATUS, status)))
+            appAutoSleepFollow(status.state == DglabNetState_Listening || status.state == DglabNetState_Paired);
+    }
+}
+#endif
+
 int main(int argc, char* argv[])
 {
     (void)argc;
@@ -2350,11 +1606,15 @@ int main(int argc, char* argv[])
         return 0;
     }
 
+#ifndef DGLAB_UI_BOREALIS
     if (!dglabFramebufferOpen()) {
         showNotice(&pad, "DGLAB-NX: the framebuffer could not be created");
         serviceClose(&dglab);
         return 0;
     }
+
+    g_framebuffer_ready = true;
+#endif
 
     logFileOpen();
 
@@ -2388,39 +1648,77 @@ int main(int argc, char* argv[])
 
     appletHook(&display_hook, appletHookCallback, NULL);
 
+#ifdef DGLAB_UI_BOREALIS
+    char ui_error[256] = {0};
+    g_native_service = &dglab;
+    DglabNativeHost native_host = {
+        .service = &dglab, .pad = &pad, .menu_selected = &g_menu_selected,
+        .about_state = nativeAboutState, .cycle_language = nativeCycleLanguage,
+        .cycle_theme = nativeCycleTheme, .is_dark = nativeIsDark,
+        .sysmodule_ok = appSysmoduleOk, .ble_active = appBleSessionActive,
+        .load_config = motionSettingsLoad, .save_config = motionSettingsSave,
+        .poll = nativePoll, .log = nativeLog,
+        .page_enter = appPageEnter, .page_update = appPageUpdate,
+        .page_state = appPageState, .page_leave = appPageLeave,
+        .exit_cleanup = appPageExitCleanup,
+    };
+    if (!dglabNativeInit(&native_host)) {
+        snprintf(ui_error, sizeof(ui_error), "%s", dglabNativeError());
+        goto app_shutdown;
+    }
+#endif
     while (true) {
+        if (!appletMainLoop()) break;
+#ifdef DGLAB_UI_BOREALIS
+        // Only one renderer owns the default window. Native child pages stay
+        // in the framework until exit or a diagnostic failure.
+        appDisplaySuspend();
+        g_display_mode_dirty = false;
+        appLanguageApply();
+        appThemeApply();
+        if (!dglabNativeResume()) {
+            snprintf(ui_error, sizeof(ui_error), "%s", dglabNativeError());
+            break;
+        }
+        DglabMenuResult selection = dglabNativeRun();
+        dglabNativeSuspend();
+        if (*dglabNativeError()) {
+            snprintf(ui_error, sizeof(ui_error), "%s", dglabNativeError());
+            break;
+        }
+#else
         if (g_display_mode_dirty) {
             g_display_mode_dirty = false;
             appDisplaySuspend();
-
             if (!appDisplayReopen()) {
                 showNotice(&pad, "DGLAB-NX: the framebuffer could not be created");
                 break;
             }
         }
-
         DglabMenuResult selection = runMenuView(&dglab, &pad);
+#endif
 
         if (selection == DglabMenuResult_Exit)
             break;
 
+#ifndef DGLAB_UI_BOREALIS
         if (selection == DglabMenuResult_Socket) {
-            runSocketView(&dglab, &pad);
+            runGameplayView(&dglab, &pad, DglabMenuResult_Socket);
             continue;
         }
 
         if (selection == DglabMenuResult_Ble) {
-            runBleView(&dglab, &pad);
+            runGameplayView(&dglab, &pad, DglabMenuResult_Ble);
             continue;
         }
 
         if (selection == DglabMenuResult_Motion) {
-            runMotionView(&dglab, &pad);
+            runGameplayView(&dglab, &pad, DglabMenuResult_Motion);
             continue;
         }
 
         if (selection == DglabMenuResult_Touch) {
-            runTouchView(&dglab, &pad);
+            runGameplayView(&dglab, &pad, DglabMenuResult_Touch);
             continue;
         }
 
@@ -2434,40 +1732,37 @@ int main(int argc, char* argv[])
             continue;
         }
 
-        // The BLE PoC view takes the console and the screen over, so the
-        // framebuffer and the shared font are released while it runs and built
-        // again afterwards - including the fonts, which used to be left closed
-        // (see appDisplayReopen). It drives the IPC session this loop already
-        // holds: the sysmodule registers with max_sessions=1, so the view opening
-        // its own session would fail with 0x615 while the socket page works.
-        appDisplaySuspend();
-        dglabBlePocViewRun(&dglab);
-
-        if (!appDisplayReopen())
-            break;
+#endif
+        break;
     }
 
+#ifdef DGLAB_UI_BOREALIS
+app_shutdown:
+#endif
+    appPageExitCleanup(&dglab);
+#ifdef DGLAB_UI_BOREALIS
+    dglabNativeShutdown();
+#endif
     appletUnhook(&display_hook);
-    dglabFramebufferClose();
-
-    // A BLE session outlives the page that started it, but not this process:
-    // nothing would be watching the device once the front end is gone, and
-    // waiting for the sysmodule's own watchdog would be an hour of output nobody
-    // asked for. The call is a no-op when no session is running.
-    serviceDispatch(&dglab, DGLAB_IPC_CMD_BLE_STOP);
+    appDisplaySuspend();
 
     // Automatic sleep is a console setting the user can change themselves, so
     // leave it the way it was found before the process goes away (and before the
     // log file closes: a failed restore is worth a line).
     appAutoSleepRestore();
 
-    if (g_log_file != NULL)
-        fclose(g_log_file);
+    Result log_stop_rc = dglabLogFileStop();
+    if (R_FAILED(log_stop_rc))
+        fprintf(stderr, "nro log writer stop failed rc=0x%08X\n", (u32)log_stop_rc);
 
     if (g_set_sys_ready)
         setsysExit();
 
     serviceClose(&dglab);
-
+#ifdef DGLAB_UI_BOREALIS
+    // Failure diagnostics must not leave a device session running while the
+    // user reads the console. Render only after all owners have been released.
+    if (*ui_error) showStartupNotice(&pad, ui_error);
+#endif
     return 0;
 }

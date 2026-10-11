@@ -17,9 +17,23 @@ NRO 负责 UI、输入玩法、参数和调试，所有 DG-LAB 通信走 sysmodu
 
 ## 页面、行与文本（必须遵守）
 
-采用 libnx framebuffer 自绘，console 留给 PoC/出错页。HOS 没有供普通 Homebrew 使用的
-通用原生 Button/List/Window 框架；仿 HOS 风格也要与系统 UI 解耦。
+普通页面默认采用 Borealis/OpenGL；libnx framebuffer 保留为对照构建，
+console 留给启动/出错页。HOS 没有供普通 Homebrew 使用的通用原生控件框架，
+Borealis 是仿 HOS 的独立 UI，不能与系统 UI 耦合。
 设计依据与实测规格见 [UI 文档](../docs/nro-ui.md)。
+
+- C++ 页面通过 `native.h` 的 C 接口复用业务、语言、配置、日志及唯一 IPC 会话。
+- 两种 UI 共用功能页控制器；采样、IPC 和波形更新在每帧入口执行，不能依赖输入回调或绘制。
+  功能页禁用框架焦点导航；日志与强度连发独立，离页清理必须先于视图销毁且允许重复调用。
+- Borealis 使用项目输入适配层，不启用上游默认 HID/六轴/触屏驱动或启动包装器。
+  跨页面/后端交接必须抑制尚未释放的按键；参数连发独立于框架导航连发。
+- 显示窗口只能有一个所有者。退出 Borealis 必须清理视图、回调、动画与字体句柄，
+  再销毁 NanoVG/GLFW、释放 pl；framebuffer/console 关闭后才能恢复新窗口。
+- Borealis 页面使用框架主题、布局和图标提示，文案继续来自根语言包；普通 UI 用 B，
+  + 不响应。参数保持文字数值和单步编辑，不增加滑块。
+- canvas 测试只验证自绘页面。新框架页面须另做截图、焦点、语言、主题及实机生命周期验证。
+
+以下绘图规则适用于保留的 framebuffer 页面及旧 UI 对照构建：
 
 - 页面为页头、行列表、底栏，无面板边框；共用 `page` 的 Begin/Header/HeaderStatus、
   ClipContent、列表绘制、ClearClip、列表滚动条与 Hints 流程。
@@ -69,5 +83,7 @@ NRO 负责 UI、输入玩法、参数和调试，所有 DG-LAB 通信走 sysmodu
 
 ## 构建
 
-源码、headers、IPC、Makefile 或 linker 改动后至少 `make -C nro`，报告实际验证；
+入口仍为 `make -C nro`，内部由 CMake 3.23+ 交叉编译；默认 Borealis，
+`UI_BACKEND=framebuffer` 构建旧 UI。依赖安装与本地缓存入口见开发文档。
+源码、headers、IPC、Makefile 或 linker 改动后至少构建受影响 UI 版本，报告实际验证；
 发布用 `make -C nro package`，产物为 `DGLAB-NX.nro` 与运行期语言包。

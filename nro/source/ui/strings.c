@@ -38,7 +38,6 @@ static const char* const kKeys[DglabString_Count] = {
     [DglabString_MenuTitle] = "menu_title",
     [DglabString_SysmoduleOk] = "sysmodule_ok",
     [DglabString_SysmoduleDown] = "sysmodule_down",
-    [DglabString_ItemBlePoc] = "item_ble_poc",
     [DglabString_BleTitle] = "ble_title",
     [DglabString_DescBle] = "desc_ble",
     [DglabString_BleState] = "ble_state",
@@ -56,7 +55,6 @@ static const char* const kKeys[DglabString_Count] = {
     [DglabString_DescTouch] = "desc_touch",
     [DglabString_DescAdvanced] = "desc_advanced",
     [DglabString_DescAbout] = "desc_about",
-    [DglabString_DescBlePoc] = "desc_ble_poc",
 
     // about
     [DglabString_AboutTitle] = "about_title",

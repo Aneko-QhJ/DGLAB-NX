@@ -25,7 +25,6 @@ static const DglabString kItemKeys[DglabMenu_ItemCount] = {
     [DglabMenu_ItemTouch] = DglabString_TouchTitle,
     [DglabMenu_ItemAdvanced] = DglabString_AdvancedTitle,
     [DglabMenu_ItemAbout] = DglabString_AboutTitle,
-    [DglabMenu_ItemBlePoc] = DglabString_ItemBlePoc,
 };
 
 static const DglabString kDescKeys[DglabMenu_ItemCount] = {
@@ -35,7 +34,6 @@ static const DglabString kDescKeys[DglabMenu_ItemCount] = {
     [DglabMenu_ItemTouch] = DglabString_DescTouch,
     [DglabMenu_ItemAdvanced] = DglabString_DescAdvanced,
     [DglabMenu_ItemAbout] = DglabString_DescAbout,
-    [DglabMenu_ItemBlePoc] = DglabString_DescBlePoc,
 };
 
 const char* dglabMenuItemName(unsigned item)

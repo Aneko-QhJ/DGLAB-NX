@@ -96,9 +96,11 @@ void dglabBleDraw(DglabCanvas* canvas, const DglabFontSet* fonts,
     DglabRow rows[BLE_ROW_COUNT];
     DglabRowBox boxes[BLE_ROW_COUNT];
     DglabHint hints[4];
-    DglabHint adjust[2] = {
+    DglabHint adjust[4] = {
         { DglabButton_Up, DglabButton_Down, dglabString(DglabString_HintAdjustA) },
         { DglabButton_Left, DglabButton_Right, dglabString(DglabString_HintAdjustB) },
+        { DglabButton_ZL, DglabButton_None, dglabString(DglabString_CmdTestA) },
+        { DglabButton_ZR, DglabButton_None, dglabString(DglabString_CmdTestB) },
     };
     DglabTextStyle title = { fonts->title, theme->text };
     DglabListStyle style;
@@ -116,10 +118,10 @@ void dglabBleDraw(DglabCanvas* canvas, const DglabFontSet* fonts,
 
     dglabPageClipContent(canvas);
 
-    // The two adjustment hints are the line above the rows, exactly where the
+    // The adjustment and test hints are the line above the rows, exactly where the
     // socket, motion and touch pages put theirs: the bottom bar is for the
     // actions a page has of its own.
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 4; i++) {
         dglabHintDraw(canvas, fonts->icon, fonts->note, &adjust[i], x, DGLAB_PAGE_CONTENT_TOP,
             theme->text);
         x += dglabHintWidth(fonts->note, &adjust[i]) + DGLAB_PAGE_HINT_GAP;

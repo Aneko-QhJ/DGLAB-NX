@@ -16,7 +16,7 @@ NRO / Overlay / Game Mod → IPC → sysmodule
 | 组件 | 当前状态 |
 | --- | --- |
 | sysmodule | WebSocket/Socket V3、Coyote V3 协议层、IPC 可用；BLE 入口已跑通，依赖补丁且无回读 |
-| NRO | 菜单、连接测试、BLE 直连、体感、触屏、参数、关于及诊断控制台可用 |
+| NRO | 普通页面已迁移到 Borealis/OpenGL，保留 framebuffer 对照构建与诊断 console；编译和主机回归通过，实机验收待完成 |
 | Overlay / Game Mod | 未实现，计划一起开发，用 Overlay 管理游戏期间的服务与 Mod |
 
 目录职责见根 AGENTS。`common/` 放共享接口，`lang/` 是运行期文案，`tests/` 是主机测试，
@@ -32,7 +32,17 @@ make                        # 全部组件并组装 build/
 make clean                  # 清除产物
 make -C sysmodule package   # 只组装后台安装目录
 make -C nro package         # 只组装前端与语言包
+make -C nro UI_BACKEND=framebuffer # 旧 UI 对照构建，会覆盖同名发布 NRO
+make -C nro                 # 恢复默认 Borealis 发布 NRO
 ```
+
+NRO 需要 CMake 3.23+。默认 UI 还需要官方 `switch-glfw`、`switch-mesa`、`switch-glm`
+及传递依赖。可用 `sudo dkp-pacman -S --needed switch-glfw switch-mesa switch-glm` 安装；
+不能写系统目录时运行 `make -C nro deps`，按现有 devkitPro 包元数据的 SHA-256 校验后
+解压到忽略的 `nro/build/portlibs/`，不更新工具链。该入口依赖 Python 3、tar 和现有
+`dkp-pacman` 数据库；包下载失败或校验不符会停止，不能静默更换依赖。
+`DGLAB_PORTLIBS` 可指定另一组官方库；Make 优先系统安装，否则使用本地缓存。
+两套 NRO 编译目录独立，均发布为同一文件名；交付前确认最后打包的是所需版本。
 
 当前产物：`build/<TITLE_ID>/` 与 `build/DGLAB-NX/`；Overlay 实现后才生成
 `build/DGLAB-NX-Ovl.ovl`。
@@ -71,7 +81,10 @@ make -C tests/ipc
 make -C tests/net
 make -C tests/qr
 make -C tests/canvas
+make -C tests/ui
 make -C tests/lang
+make -C tests/log
+make -C tests/ble
 make -C tests/motion
 make -C tests/touch
 make -C tests/stack
@@ -79,7 +92,11 @@ make -C tests/stack
 
 主机测试覆盖范围以各测试目录为准，不在文档重复用例与数量。
 `tests/ipc` 需要 libnx headers；`tests/stack` 需要 devkitA64，其余用系统编译器。
-UI 图片预览命令见 `tests/canvas/tools/render_preview.c` 文件头。
+旧 UI 图片预览命令见 `tests/canvas/tools/render_preview.c` 文件头。
+新功能页可在 macOS 用 `make -C tests/ui preview FONT="$FONT"` 生成实际
+Borealis/Yoga/NanoVG 控件树的截图，`FONT` 指向本地可显示简中的字体文件。
+结果位于忽略的 `tests/ui/build/captures/`，覆盖两语言、两主题和两分辨率；
+这是 CoreGraphics 软件渲染，不代表 Switch OpenGL、系统字体或手柄验证。
 
 已实机确认：Socket V3 控制输出、Joy-Con 左右驱动对应通道、触屏可运行、两种 NRO
 启动方式的自动休眠抑制；BLE 连接/GATT/写入及默认波形灯闪。
@@ -92,7 +109,10 @@ BLE 跨页玩法、可感强度档位、蓝牙共存/睡眠兼容及补丁发布
 - Overlay 与 Game Mod：共同开发，支持游戏与 NRO 无法同时运行的场景。
 - Socket V4：因 V4 App 向下兼容 V3 暂搁置；待官方 beta 稳定与 App 版本确认后，
   做外壳、绑定、二维码、主机回环及实机验证。
-- deko3d 呈现层：收益较低暂搁置；已核对限制与备选路线见 UI 文档。
+- NRO UI：普通页面已完成 Borealis 迁移；[功能页移植与验证](nro-ui.md#功能页移植2026-10-11)
+  记录共享调度、回归与待实机项。优先复测退出崩溃，并对照两种 UI 测量性能和内存。
+- 独立 deko3d 呈现后端：已放弃，仅替换呈现没有显而易见的观感/交互收益；
+  [依据与适用边界](nro-ui.md#deko3d-后端评估已放弃)不排除 UI 库内部使用该 API。
 - 文档、测试和错误处理随改动同步。
 
 ## 文档索引
@@ -104,7 +124,7 @@ BLE 跨页玩法、可感强度档位、蓝牙共存/睡眠兼容及补丁发布
 | [Coyote](dglab-protocol.md) | 蓝牙协议来源、实现选择与验证边界 |
 | [BLE 验证](ble-poc.md) | 直连与探针操作、实机证据、验收 |
 | [BLE 固件研究](ble-re.md) | HOS 22.5.0 的服务限制、补丁依据与风险 |
-| [NRO UI](nro-ui.md) | 布局/字体/主题依据及后端取舍 |
+| [NRO UI](nro-ui.md) | 新旧 UI 构建与生命周期、首轮移植验证、库选型及已放弃的后端路线 |
 | [Joy-Con](joycon-input.md) | 输入设计、实机观察与调参边界 |
 | [触屏](touch-input.md) | 触点设计、参数复用与实机验收 |
 | [文档约定](docs-audit.md) | 分层、事实保留与检查规则 |

@@ -52,13 +52,26 @@ static const DglabString kDescKeys[DglabMotionSetting_Count] = {
     [DglabMotionSetting_ChannelLimitB] = DglabString_DescChannelLimit,
 };
 
+const char* dglabAdvancedName(unsigned setting)
+{
+    return setting < DglabMotionSetting_Count ? dglabString(kNameKeys[setting]) : "";
+}
+const char* dglabAdvancedDescription(unsigned setting)
+{
+    return setting < DglabMotionSetting_Count ? dglabString(kDescKeys[setting]) : "";
+}
+void dglabAdvancedValue(const DglabMotionFeedConfig* config, unsigned setting,
+    char* out, size_t size)
+{
+    if (dglabMotionSettingsIsSwitch(setting))
+        snprintf(out, size, "%s", dglabString(config->density_fixed
+            ? DglabString_DensityFixedValue : DglabString_DensityVariableValue));
+    else
+        dglabMotionSettingsFormat(config, setting, out, size);
+}
+
 // The switch row's value: the screen shows a word where every other row shows a
 // number, so it is formatted here rather than through motion_settings.c.
-static void densityValue(const DglabMotionFeedConfig* config, char* out, size_t out_size)
-{
-    snprintf(out, out_size, "%s", dglabString(config->density_fixed
-            ? DglabString_DensityFixedValue : DglabString_DensityVariableValue));
-}
 
 void dglabAdvancedDraw(DglabCanvas* canvas, const DglabFontSet* fonts,
     const DglabAdvancedState* state)
@@ -88,11 +101,7 @@ void dglabAdvancedDraw(DglabCanvas* canvas, const DglabFontSet* fonts,
     memset(rows, 0, sizeof(rows));
 
     for (unsigned setting = 0; setting < (unsigned)DglabMotionSetting_Count; setting++) {
-        if (dglabMotionSettingsIsSwitch(setting))
-            densityValue(state->config, values[setting], sizeof(values[setting]));
-        else
-            dglabMotionSettingsFormat(state->config, setting, values[setting],
-                sizeof(values[setting]));
+        dglabAdvancedValue(state->config, setting, values[setting], sizeof(values[setting]));
 
         if (setting == selected)
             focus = count;

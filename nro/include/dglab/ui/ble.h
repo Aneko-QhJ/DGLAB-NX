@@ -4,8 +4,8 @@
 //
 // The sysmodule owns the session (it is the only component that may hold the
 // connection); this page starts it, stops it, and shows what BLE_STATUS reports.
-// Starting is two steps because the transport needs two: the driver-level probe
-// brings the Bluetooth stack up, then the session connects (docs/ble-poc.md).
+// Starting is two steps: the driver-level probe brings the Bluetooth stack up,
+// then the session connects (docs/ble-poc.md).
 //
 // The page is the two channel strengths and what the session is doing, nothing
 // else: the two channel ceilings are settings (the parameters page owns them) and
@@ -16,6 +16,9 @@
 // channel A rather than to a scroll. What the rows cannot say (the device never
 // reports back on this firmware, so these are the values this side asked for, see
 // docs/ble-re.md) is in the mode's description on the menu.
+//
+// ZL/ZR send the same one-shot A/B tests as the Socket page. Connecting alone
+// does not start waveform playback.
 //
 // Strength is dialled here exactly the way the socket and gameplay pages dial
 // it (up/down channel A, left/right channel B, hold to walk), because the
@@ -34,8 +37,8 @@
 typedef struct {
     DglabBleStatus status; ///< what the last BLE_STATUS reported
     bool sysmodule_ok;     ///< the header's liveness line
-    bool driver_running;   ///< step 1 of the start sequence is still running
-    bool starting;         ///< ...and step 2 has not been sent yet
+    bool driver_running;   ///< the driver-level startup is still running
+    bool starting;         ///< BLE_START has not yet been sent
     /// The two channel strength ceilings the session is started with, read from
     /// the shared settings (0..100). Not the strengths below them: they are the
     /// ceiling half of those two rows, and the value the D-pad stops at.

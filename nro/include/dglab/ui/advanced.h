@@ -19,3 +19,8 @@ typedef struct {
 
 void dglabAdvancedDraw(DglabCanvas* canvas, const DglabFontSet* fonts,
     const DglabAdvancedState* state);
+
+const char* dglabAdvancedName(unsigned setting);
+const char* dglabAdvancedDescription(unsigned setting);
+void dglabAdvancedValue(const DglabMotionFeedConfig* config, unsigned setting,
+    char* out, size_t size);

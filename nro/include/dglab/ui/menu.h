@@ -15,7 +15,6 @@ typedef enum {
     DglabMenu_ItemTouch,      ///< touch panel driven waveform
     DglabMenu_ItemAdvanced,   ///< the motion parameters
     DglabMenu_ItemAbout,      ///< project info and the language
-    DglabMenu_ItemBlePoc,     ///< the abandoned BLE console, kept for diagnostics
     DglabMenu_ItemCount,
 } DglabMenuItem;
 

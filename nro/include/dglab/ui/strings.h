@@ -39,7 +39,6 @@ typedef enum {
     // The menu's entries are the pages' own titles (see menu.c): one string per
     // page, so a list entry and the page it opens can never drift apart. The BLE
     // PoC console is the exception - it has no page of its own in this UI.
-    DglabString_ItemBlePoc,
     // The Bluetooth page: the dedicated screen for driving the device directly
     // (docs/ble-poc.md). Its rows are the session the sysmodule reports and the
     // two numbers this side controls.
@@ -63,7 +62,6 @@ typedef enum {
     DglabString_DescTouch,
     DglabString_DescAdvanced,
     DglabString_DescAbout,
-    DglabString_DescBlePoc,
 
     // about
     DglabString_AboutTitle,
