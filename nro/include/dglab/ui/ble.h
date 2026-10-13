@@ -10,7 +10,7 @@
 // The page is the two channel strengths and what the session is doing, nothing
 // else: the two channel ceilings are settings (the parameters page owns them) and
 // they are already readable as the ceiling half of each strength row, so the page
-// does not repeat them as rows, and it carries no text blocks - the two
+// does not repeat them as rows, and a short note reports patch/edit status. The two
 // adjustment hints are the line above the rows, the same line every other
 // gameplay page has, and the page fits one screen because up and down belong to
 // channel A rather than to a scroll. What the rows cannot say (the device never
@@ -28,6 +28,7 @@
 // them, so "the cap" has one home and "the strength" has another.
 
 #include <dglab/ipc.h>
+#include <dglab/nro/ble_settings.h>
 #include <dglab/ui/canvas.h>
 #include <dglab/ui/list.h>
 #include <dglab/ui/text.h>
@@ -36,6 +37,8 @@
 
 typedef struct {
     DglabBleStatus status; ///< what the last BLE_STATUS reported
+    bool address_valid;
+    DglabBleEditResult edit_result;
     bool sysmodule_ok;     ///< the header's liveness line
     bool driver_running;   ///< the driver-level startup is still running
     bool starting;         ///< BLE_START has not yet been sent
@@ -52,6 +55,9 @@ typedef struct {
     bool log_open;
     int log_offset;
 } DglabBlePageState;
+
+const char* dglabBlePatchMessage(DglabBlePatchResult result);
+const char* dglabBleEditMessage(DglabBleEditResult result);
 
 void dglabBleDraw(DglabCanvas* canvas, const DglabFontSet* fonts,
     const DglabBlePageState* state);

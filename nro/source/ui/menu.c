@@ -108,7 +108,8 @@ void dglabMenuDraw(DglabCanvas* canvas, const DglabFontSet* fonts, const DglabMe
         if (item == selected)
             rows[count++] = (DglabRow){
                 .kind = DglabRow_Note,
-                .label = dglabMenuItemDescription(item),
+                .label = item == DglabMenu_ItemBle && state && state->ble_error
+                    ? state->ble_error : dglabMenuItemDescription(item),
             };
     }
 

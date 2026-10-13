@@ -551,6 +551,7 @@ static void bleEnter(BlePage* v)
 {
     memset(v, 0, sizeof(*v));
     motionSettingsLoad(&v->config);
+    v->state.address_valid = loadBleAddress(v->state.status.address);
     v->state.limit_a = v->config.channel_limit_a;
     v->state.limit_b = v->config.channel_limit_b;
 }
@@ -656,7 +657,8 @@ static void bleUpdate(BlePage* v, Service* dglab, PadState* pad, u64 down, u64 h
 
         memcpy(address, v->state.status.address, sizeof(address));
         v->state.status = status;
-        memcpy(v->state.status.address, address, sizeof(address));
+        if (bleStateIsActive(status.state)) v->state.address_valid = true;
+        else memcpy(v->state.status.address, address, sizeof(address));
     }
 
     // Step 1 of the start sequence: wait for the driver-level session to
@@ -822,6 +824,7 @@ static void appPageLeave(void)
 static void appPageEnter(Service* service, PadState* pad, DglabMenuResult page)
 {
     appPageLeave();
+    if (page == DglabMenuResult_Ble && appBlePatchCheck() != DglabBlePatch_Ok) return;
     memset(&g_page, 0, sizeof(g_page));
     g_page.service = service;
     g_page.pad = pad;
@@ -858,14 +861,14 @@ static bool appPageUpdate(u64 down, u64 held, u64 now_ns)
             appPageUpdateMetrics();
     }
     g_page.last_update_ns = now_ns;
+    g_page.blocked &= held;
+    down &= ~g_page.blocked;
+    held &= ~g_page.blocked;
     // A return press wins over other actions and over another waveform upload.
     if (down & HidNpadButton_B) {
         appPageLeave();
         return false;
     }
-    g_page.blocked &= held;
-    down &= ~g_page.blocked;
-    held &= ~g_page.blocked;
     if ((g_page.page == DglabMenuResult_Socket || g_page.page == DglabMenuResult_Ble) &&
         (down & HidNpadButton_Y)) {
         g_page.blocked = held;
@@ -882,6 +885,22 @@ static bool appPageUpdate(u64 down, u64 held, u64 now_ns)
     if (g_page.page == DglabMenuResult_Ble) bleLogPoll(service);
     buildLogPointers(&g_log_net);
     buildLogPointers(&g_log_ble);
+    if (g_page.page == DglabMenuResult_Ble && (down & HidNpadButton_L) &&
+        !(down & HidNpadButton_Y) && !g_page.view.ble.state.log_open) {
+        BlePage* v = &g_page.view.ble;
+        DglabBleStatus current = {0};
+        Result rc = serviceDispatchOut(service, DGLAB_IPC_CMD_BLE_STATUS, current);
+        if (!v->state.starting && R_SUCCEEDED(rc) && !bleStateIsActive(current.state)) {
+            v->state.edit_result = bleEditAddress(v->state.status.address);
+            if (v->state.edit_result == DglabBleEdit_Saved) v->state.address_valid = true;
+            padUpdate(g_page.pad);
+            g_page.blocked = padGetButtons(g_page.pad);
+            g_strength_hold_started_ns = g_strength_last_repeat_ns = 0;
+            g_log_hold_started_ns = g_log_last_repeat_ns = 0;
+            v->last_frame_ns = v->last_heartbeat_ns = 0;
+            return true; // Ignore all inputs sampled before the applet.
+        }
+    }
     switch (g_page.page) {
         case DglabMenuResult_Socket:
             socketUpdate(&g_page.view.socket, service, down, held, now_ns); break;

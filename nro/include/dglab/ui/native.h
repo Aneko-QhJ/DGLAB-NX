@@ -1,5 +1,6 @@
 #pragma once
 #include <switch.h>
+#include <dglab/nro/ble_settings.h>
 #include <dglab/ui/about.h>
 #include <dglab/ui/menu.h>
 #include <dglab/nro/motion_settings.h>
@@ -41,6 +42,7 @@ typedef struct {
     bool (*is_dark)(void);
     bool (*sysmodule_ok)(Service* service);
     bool (*ble_active)(Service* service);
+    DglabBlePatchResult (*ble_check)(void);
     void (*load_config)(DglabMotionFeedConfig* config);
     bool (*save_config)(const DglabMotionFeedConfig* config);
     void (*poll)(void);

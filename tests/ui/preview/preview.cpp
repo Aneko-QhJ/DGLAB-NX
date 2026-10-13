@@ -273,7 +273,7 @@ int main(int argc, char** argv) {
             for (auto lang : {DglabLanguage_English, DglabLanguage_ChineseSimplified}) {
                 if (argc == 5 && lang != DglabLanguage_English) continue;
                 dglabStringsSetLanguage(lang);
-                for (int scenario = 0; scenario < 9; ++scenario) {
+                for (int scenario = 0; scenario < 12; ++scenario) {
                     if (scenario == 8) {
                         DglabAboutState state{};
                         state.app_version = "0.0.0-test"; state.build_id = "v0.0.0-109-g0123456-dirty";
@@ -306,7 +306,7 @@ int main(int argc, char** argv) {
                     }
                     DglabGameplayState s{};
                     s.page = scenario == 0 || scenario == 4 || scenario == 6 ? DglabMenuResult_Socket :
-                        scenario == 1 || scenario == 5 ? DglabMenuResult_Ble :
+                        scenario == 1 || scenario == 5 || scenario >= 9 ? DglabMenuResult_Ble :
                         scenario == 2 ? DglabMenuResult_Motion : DglabMenuResult_Touch;
                     std::array<std::string, DGLAB_SCREEN_LOG_LINES> lines;
                     std::array<const char*, DGLAB_SCREEN_LOG_LINES> pointers;
@@ -325,7 +325,10 @@ int main(int argc, char** argv) {
                         v.last_command = "A Test  rejected 0x12345678"; v.last_command_tone = DglabCmdTone_Error;
                         v.log_open = scenario == 4;
                     } else if (s.page == DglabMenuResult_Ble) {
-                        auto& v = s.value.ble; v.sysmodule_ok = true; v.status.state = DglabBleState_Connected;
+                        auto& v = s.value.ble; v.sysmodule_ok = true; v.address_valid = scenario != 9;
+                        v.status.state = scenario >= 9 ? DglabBleState_Idle : DglabBleState_Connected;
+                        if (scenario == 10) v.edit_result = DglabBleEdit_Invalid;
+                        if (scenario == 11) v.edit_result = DglabBleEdit_SaveFailed;
                         v.limit_a = v.limit_b = 100; v.strength_a = 80; v.strength_b = 12; v.log_open = scenario == 5;
                     } else if (s.page == DglabMenuResult_Motion) {
                         auto& v = s.value.motion; v.sysmodule_ok = v.left_connected = v.right_connected = v.server_running = true;

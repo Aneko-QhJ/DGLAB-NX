@@ -32,7 +32,7 @@ BUILD    := build
 TESTS  := $(wildcard test_*.c)
 BINS   := $(patsubst test_%.c,$(BUILD)/test_%,$(TESTS))
 # joycon.c is left out on purpose: it is the one motion file that needs libnx.
-SOURCES := $(wildcard $(NRO)/source/ui/*.c) $(NRO)/source/motion/motion_feed.c \
+SOURCES := $(NRO)/source/config/ble_settings.c $(wildcard $(NRO)/source/ui/*.c) $(NRO)/source/motion/motion_feed.c \
 	$(NRO)/source/motion/motion_settings.c $(NRO)/source/util/json.c
 HEADERS := $(wildcard $(NRO)/include/dglab/ui/*.h) $(wildcard $(NRO)/include/dglab/nro/*.h) \
 	$(wildcard $(COMMON)/dglab/*.h)

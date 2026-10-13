@@ -1725,6 +1725,18 @@ static void checkEveryPage(const char* frames, const DglabFontSet* fonts)
             checkPageStaysInItsRegions(name, blue, PageRegion_Rows);
         }
 
+        for (DglabBlePatchResult result = DglabBlePatch_FirmwareUnknown;
+             result <= DglabBlePatch_Invalid; ++result) {
+            DglabMenuState menu = {0};
+            menu.selected = DglabMenu_ItemBle;
+            menu.ble_error = dglabBlePatchMessage(result);
+            char name[96];
+            snprintf(name, sizeof(name), "%s denied BLE %u", frames, (unsigned)result);
+            beginPage(&canvas, blue);
+            dglabMenuDraw(&canvas, fonts, &menu);
+            checkPageStaysInItsRegions(name, blue, PageRegion_Rows);
+        }
+
         // The socket page, in the states that change what it draws: the server
         // running or not, a QR code available or not, and - while the server runs
         // - whether automatic sleep is suppressed, which is the other wording of
@@ -1966,12 +1978,13 @@ static void checkEveryPage(const char* frames, const DglabFontSet* fonts)
         // the sysmodule cannot be reached. The page carries no text blocks and
         // fits one screen - up and down are channel A's keys, so nothing can
         // scroll it (docs/nro-ui.md).
-        for (unsigned variant = 0; variant < 3; variant++) {
+        for (unsigned variant = 0; variant < 6; variant++) {
             DglabBlePageState ble;
             char name[96];
 
             memset(&ble, 0, sizeof(ble));
             ble.sysmodule_ok = variant < 2;
+            if (variant >= 3) ble.edit_result = (DglabBleEditResult)(variant - 1);
             ble.limit_a = 20u;
             ble.limit_b = 100u;
             ble.strength_a = 5u;
@@ -1980,6 +1993,7 @@ static void checkEveryPage(const char* frames, const DglabFontSet* fonts)
             if (variant == 1) {
                 ble.status.state = DglabBleState_Connected;
                 ble.status.connected = 1;
+                ble.address_valid = true;
                 ble.status.address[0] = 0xEA;
                 ble.status.address[1] = 0xA8;
                 ble.status.address[2] = 0xAC;

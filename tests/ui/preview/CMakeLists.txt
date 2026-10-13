@@ -20,6 +20,7 @@ add_executable(preview preview.cpp ${FRAMEWORK} ${RETRO}
     "${BRLS}/lib/extern/tinyxml2/tinyxml2.cpp" "${BRLS}/lib/extern/glad/glad.c"
     "${BRLS}/lib/extern/nanovg/nanovg.c" "${ROOT}/nro/source/borealis/gameplay.cpp"
     "${ROOT}/nro/source/borealis/about.cpp" "${ROOT}/nro/source/util/json.c")
+target_sources(preview PRIVATE "${ROOT}/nro/source/ui/ble.c" "${ROOT}/nro/source/config/ble_settings.c")
 foreach(source screen canvas page list button text theme strings language qr about menu)
     target_sources(preview PRIVATE "${ROOT}/nro/source/ui/${source}.c")
 endforeach()

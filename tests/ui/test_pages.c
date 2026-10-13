@@ -39,6 +39,16 @@ static u64 now_ns = 1000000000;
 static unsigned stops, clears, uploads, sensors_started, sensors_stopped;
 static unsigned touch_started, touch_polled, motion_polled, adjustments, scrolls, rescans;
 static unsigned net_starts, net_stops, preparation_starts, ble_starts, ble_stops;
+static DglabBlePatchResult patch_result;
+static DglabBleEditResult edit_result;
+static unsigned edits;
+static DglabBlePatchResult appBlePatchCheck(void) { return patch_result; }
+static DglabBleEditResult bleEditAddress(u8 out[6]) {
+    ++edits;
+    if (edit_result == DglabBleEdit_Saved) memset(out, 0xAA, 6);
+    pad.buttons = HidNpadButton_A | HidNpadButton_B;
+    return edit_result;
+}
 static bool address_available = true, asleep_suppressed, status_failure;
 static DglabNetStatus net_status;
 static DglabBleStatus ble_status;
@@ -245,9 +255,48 @@ static void test_status_and_handoff(void) {
     status_failure = true; tick(0); assert(!appPageState()->value.socket.status_ok);
     assert(!asleep_suppressed); appPageLeave();
 }
+static void test_ble_gate_and_editor(void) {
+    unsigned starts = preparation_starts, connects = ble_starts;
+    patch_result = DglabBlePatch_Missing;
+    appPageEnter(&service, &pad, DglabMenuResult_Ble);
+    assert(!appPageUpdate(HidNpadButton_A, HidNpadButton_A, now_ns));
+    assert(preparation_starts == starts && ble_starts == connects);
+    patch_result = DglabBlePatch_Ok;
+    ble_status.state = DglabBleState_Idle;
+    appPageEnter(&service, &pad, DglabMenuResult_Ble);
+    edit_result = DglabBleEdit_None;
+    tick(HidNpadButton_L);
+    assert(edits == 1 && appPageState()->value.ble.status.address[0] == 1);
+    // Confirmation/cancel buttons sampled after keyboard must be released.
+    assert(appPageUpdate(HidNpadButton_A | HidNpadButton_B,
+        HidNpadButton_A | HidNpadButton_B, now_ns));
+    assert(preparation_starts == starts);
+    tick(0);
+    edit_result = DglabBleEdit_SaveFailed;
+    tick(HidNpadButton_L);
+    assert(edits == 2 && appPageState()->value.ble.status.address[0] == 1);
+    tick(0);
+    edit_result = DglabBleEdit_Saved;
+    tick(HidNpadButton_L | HidNpadButton_A);
+    assert(edits == 3 && appPageState()->value.ble.status.address[0] == 0xAA);
+    assert(preparation_starts == starts);
+    tick(0);
+    ble_status.state = DglabBleState_Connecting;
+    tick(HidNpadButton_L); assert(edits == 3);
+    ble_status.state = DglabBleState_Connected;
+    tick(HidNpadButton_L); assert(edits == 3);
+    ble_status.state = DglabBleState_Idle;
+    g_page.view.ble.state.starting = true;
+    preparation.state = DglabPocState_Initializing;
+    tick(HidNpadButton_L); assert(edits == 3);
+    g_page.view.ble.state.starting = false;
+    tick(HidNpadButton_Y); tick(HidNpadButton_L); assert(edits == 3);
+    appPageLeave();
+}
 int main(void) {
     test_logs(); test_ble_lifecycle(); test_gameplay_cleanup(); test_status_and_handoff();
     status_failure = false;
+    test_ble_gate_and_editor();
     appPageEnter(&service, &pad, DglabMenuResult_Socket);
     for (unsigned i = 0; i < 600; ++i) tick(0);
     appPageLeave();

@@ -18,6 +18,7 @@ typedef struct { u64 buttons; } PadState;
 #define HidNpadButton_B (1ull << 1)
 #define HidNpadButton_X (1ull << 2)
 #define HidNpadButton_Y (1ull << 3)
+#define HidNpadButton_L (1ull << 6)
 #define HidNpadButton_ZL (1ull << 8)
 #define HidNpadButton_ZR (1ull << 9)
 #define HidNpadButton_Left (1ull << 12)
@@ -33,6 +34,8 @@ typedef struct { u64 buttons; } PadState;
 #define HidNpadAttribute_IsConnected (1u << 0)
 #define HidNpadAttribute_IsLeftConnected (1u << 2)
 #define HidNpadAttribute_IsRightConnected (1u << 4)
+static inline void padUpdate(PadState* p) { (void)p; }
+static inline u64 padGetButtons(const PadState* p) { return p->buttons; }
 u64 armGetSystemTick(void);
 static inline u64 armTicksToNs(u64 ticks) { return ticks; }
 u32 hidGetNpadDeviceType(unsigned id);

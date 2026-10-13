@@ -25,6 +25,7 @@ typedef struct {
     /// that started it, so the menu says so under that entry (and where to stop
     /// it) instead of leaving the user to guess why the device is being driven.
     bool ble_active;
+    const char* ble_error; ///< localized entry refusal; borrowed for drawing
 } DglabMenuState;
 
 void dglabMenuDraw(DglabCanvas* canvas, const DglabFontSet* fonts, const DglabMenuState* state);

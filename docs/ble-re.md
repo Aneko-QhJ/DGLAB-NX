@@ -119,22 +119,29 @@ GATT 发现需等事件后重试，不能连接刚建立就判 total=0 为无服
 
 | ELF 地址 | 原字节（内存顺序） | 新字节 | 作用 |
 | --- | --- | --- | --- |
-| 0xcd820 | 48000034 | d503201f | cbz 改 NOP |
-| 0xcf7d4 | c9020034 | d503201f | cbz 改 NOP |
+| 0xcd820 | 48000034 | 1f2003d5 | cbz 改 NOP |
+| 0xcf7d4 | c9020034 | 1f2003d5 | cbz 改 NOP |
 
 ```sh
 python3 tools/ble-re/make_ips.py \
   --elf /tmp/ble-re/nso-010000000000000b.elf \
   --module-id c91c6fc8aa4c39222d6ccfe0fff468543105e59b \
-  --edit 0xcd820:48000034:d503201f \
-  --edit 0xcf7d4:c9020034:d503201f \
+  --edit 0xcd820:48000034:1f2003d5 \
+  --edit 0xcf7d4:c9020034:1f2003d5 \
   --out build/exefs_patches/DGLAB-NX-BLE/C91C6FC8AA4C39222D6CCFE0FFF468543105E59B000000000000000000000000.ips
 ```
 
+两处 NOP 的文件字节均为 `1f2003d5`；AArch64 反汇编显示的指令字 `d503201f`
+不能直接作为内存字节写入。旧文档的替换字节顺序已纠正。
 脚本校验旧字节，不能对不匹配构建强打。IPS 偏移=0x100＋ELF 地址，来自 Atmosphère
 `ldr_patcher.cpp` 的 NSO header 保护约定；输入字节来自解压 ELF，不是压缩 NSO 段。
 将 DGLAB-NX-BLE 目录放 `SD:/atmosphere/exefs_patches/` 后弹出整盘、重启；
 撤销为删除该目录/文件再重启。补丁尚未纳入发行包。
+
+NRO 每次进入蓝牙页检查系统版本，以及 `exefs_patches` 子目录中此 Build ID 的
+IPS/IPS32 文件（支持名称末尾零补齐），只接受上述两处修改。缺失、不可读、损坏、
+额外诊断修改或非 HOS 22.5.0 均拒绝进入；同一 Build ID 有多份文件时，全部须通过。
+这是文件检查，不能证明正在运行的 Bluetooth 模块已加载补丁；安装后仍须重启。
 
 ### 加载判据与风险
 

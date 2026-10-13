@@ -489,6 +489,7 @@ int main(int argc, char** argv)
         ble.status.state = DglabBleState_Connected;
         ble.status.connected = 1u;
         ble.status.packets = 172u;
+        ble.address_valid = true;
         ble.status.address[0] = 0xEA;
         ble.status.address[1] = 0xA8;
         ble.status.address[2] = 0xAC;

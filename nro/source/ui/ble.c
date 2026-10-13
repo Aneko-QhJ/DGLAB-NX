@@ -16,7 +16,7 @@
 // The page fits one screen on purpose. Up and down are channel A's keys here, so
 // there is no key left to scroll with, and the project's rule is that a page
 // without a scroll key carries no more than a screen.
-#define BLE_ROW_COUNT 5
+#define BLE_ROW_COUNT 6
 
 static const char* stateName(u32 state)
 {
@@ -28,22 +28,27 @@ static const char* stateName(u32 state)
     }
 }
 
-static void deviceText(const DglabBleStatus* status, char* out, size_t size)
+const char* dglabBlePatchMessage(DglabBlePatchResult result)
 {
-    bool any = false;
-
-    for (int i = 0; i < 6; i++) {
-        if (status->address[i] != 0)
-            any = true;
+    switch (result) {
+        case DglabBlePatch_FirmwareUnknown: return dglabString(DglabString_BlePatchUnknown);
+        case DglabBlePatch_UnsupportedFirmware: return dglabString(DglabString_BlePatchUnsupported);
+        case DglabBlePatch_Missing: return dglabString(DglabString_BlePatchMissing);
+        case DglabBlePatch_Unreadable: return dglabString(DglabString_BlePatchUnreadable);
+        case DglabBlePatch_Invalid: return dglabString(DglabString_BlePatchInvalid);
+        default: return NULL;
     }
+}
 
-    if (!any) {
-        snprintf(out, size, "%s", dglabString(DglabString_BleDeviceNone));
-        return;
+const char* dglabBleEditMessage(DglabBleEditResult result)
+{
+    switch (result) {
+        case DglabBleEdit_Saved: return dglabString(DglabString_BleMacSaved);
+        case DglabBleEdit_KeyboardFailed: return dglabString(DglabString_BleKeyboardFailed);
+        case DglabBleEdit_Invalid: return dglabString(DglabString_BleMacInvalid);
+        case DglabBleEdit_SaveFailed: return dglabString(DglabString_BleMacSaveFailed);
+        default: return dglabString(DglabString_BlePatchFileOnly);
     }
-
-    snprintf(out, size, "%02X:%02X:%02X:%02X:%02X:%02X", status->address[0], status->address[1],
-        status->address[2], status->address[3], status->address[4], status->address[5]);
 }
 
 // One buffer per row: the rows are drawn after the whole list is built, so a
@@ -62,7 +67,8 @@ static int buildRows(const DglabBlePageState* state, DglabRow* rows, BleRowText*
     const DglabTheme* theme = dglabThemeGet();
     int count = 0;
 
-    deviceText(&state->status, text->device, sizeof(text->device));
+    if (state->address_valid) dglabBleAddressFormat(state->status.address, text->device);
+    else snprintf(text->device, sizeof(text->device), "%s", dglabString(DglabString_BleDeviceNone));
     // value/ceiling, like the socket and gameplay pages: the strength the D-pad
     // dials, over the channel ceiling it stops at.
     snprintf(text->strength_a, sizeof(text->strength_a), "%u/%u", (unsigned)state->strength_a,
@@ -85,6 +91,8 @@ static int buildRows(const DglabBlePageState* state, DglabRow* rows, BleRowText*
         theme->text };
     rows[count++] = (DglabRow){ DglabRow_Item, dglabString(DglabString_BlePackets), text->packets,
         NULL, theme->text };
+    rows[count++] = (DglabRow){ .kind = DglabRow_Note,
+        .label = dglabBleEditMessage(state->edit_result) };
     return count;
 }
 
@@ -95,7 +103,7 @@ void dglabBleDraw(DglabCanvas* canvas, const DglabFontSet* fonts,
     DglabListFonts list_fonts = { fonts->body, fonts->value, fonts->note };
     DglabRow rows[BLE_ROW_COUNT];
     DglabRowBox boxes[BLE_ROW_COUNT];
-    DglabHint hints[4];
+    DglabHint hints[5];
     DglabHint adjust[4] = {
         { DglabButton_Up, DglabButton_Down, dglabString(DglabString_HintAdjustA) },
         { DglabButton_Left, DglabButton_Right, dglabString(DglabString_HintAdjustB) },
@@ -146,5 +154,10 @@ void dglabBleDraw(DglabCanvas* canvas, const DglabFontSet* fonts,
         dglabString(DglabString_ActionStop), };
     hints[3] = (DglabHint){ DglabButton_B, DglabButton_None,
         dglabString(DglabString_ActionBack), };
-    dglabPageHints(canvas, fonts->icon, fonts->body, hints, 4);
+    int hint_count = 4;
+    if (!state->starting && state->status.state != DglabBleState_Connecting &&
+        state->status.state != DglabBleState_Connected)
+        hints[hint_count++] = (DglabHint){ DglabButton_L, DglabButton_None,
+            dglabString(DglabString_BleEditMac) };
+    dglabPageHints(canvas, fonts->icon, fonts->body, hints, hint_count);
 }

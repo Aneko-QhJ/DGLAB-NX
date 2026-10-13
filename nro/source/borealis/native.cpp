@@ -283,6 +283,13 @@ struct Screen {
             [this, index](brls::View*) {
                 if (page != Page::Menu) return true;
                 selected = index; *host.menu_selected = index;
+                if (index == DglabMenu_ItemBle) {
+                    auto check = host.ble_check();
+                    if (check != DglabBlePatch_Ok) {
+                        note->setText(dglabBlePatchMessage(check));
+                        return true;
+                    }
+                }
                 if (index == DglabMenu_ItemAbout) { finish = true; next = Page::About; }
                 else if (index == DglabMenu_ItemAdvanced) { finish = true; next = Page::Parameters; }
                 else if (index <= DglabMenu_ItemTouch) {
@@ -462,6 +469,7 @@ extern "C" const char* dglabNativeError() { return error.c_str(); }
 extern "C" DglabMenuResult dglabNativeRun() {
     if (!active) return DglabMenuResult_Exit;
     Page page = Page::Menu;
+    std::string menuError;
     float aboutOffset = 0;
     try {
         for (;;) {
@@ -472,12 +480,25 @@ extern "C" DglabMenuResult dglabNativeRun() {
             resetKeys();
             navigationEnabled = page == Page::Menu || page == Page::Parameters;
             gameplayMode = isGameplay(page);
-            if (gameplayMode) host.page_enter(host.service, host.pad, static_cast<DglabMenuResult>(page));
+            if (gameplayMode) {
+                host.page_enter(host.service, host.pad, static_cast<DglabMenuResult>(page));
+                if (host.page_state()->page == DglabMenuResult_Exit) {
+                    const char* message = dglabBlePatchMessage(host.ble_check());
+                    menuError = message ? message : "";
+                    delete screen->frame;
+                    page = Page::Menu;
+                    continue;
+                }
+            }
             beforeFrame = [current = screen.get()] { current->before(); };
             const unsigned initialSelection = screen->selected;
             brls::Application::pushActivity(new brls::Activity(screen->frame));
             metrics("page present", armTicksToNs(armGetSystemTick() - pageStarted));
             if (!screen->rows.empty()) brls::Application::giveFocus(screen->rows[initialSelection]);
+            if (page == Page::Menu && !menuError.empty()) {
+                screen->note->setText(menuError);
+                menuError.clear();
+            }
             bool running = true;
             while (!screen->finish && !screen->rebuild) {
                 u64 frameStarted = armGetSystemTick();

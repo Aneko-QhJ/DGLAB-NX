@@ -3,7 +3,8 @@ CFLAGS := -std=c11 -Wall -Wextra -Werror -O2 -g
 CXXFLAGS := -std=c++17 -Wall -Wextra -Werror -O2 -g
 ROOT := ../..
 .PHONY: all clean preview
-all: build/test_input build/test_texture_lifecycle build/test_pages build/test_presentation
+all: build/test_ble_settings build/test_input build/test_texture_lifecycle build/test_pages build/test_presentation
+	./build/test_ble_settings
 	./build/test_input
 	./build/test_texture_lifecycle
 	./build/test_pages
@@ -31,3 +32,7 @@ preview:
 	cmake -S preview -B build/preview -DCMAKE_BUILD_TYPE=Debug -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 	cmake --build build/preview --parallel 8
 	./build/preview/preview "$(abspath $(ROOT))" "$(FONT)" "$(abspath build/captures)"
+
+build/test_ble_settings: test_ble_settings.c $(ROOT)/nro/source/config/ble_settings.c $(ROOT)/nro/include/dglab/nro/ble_settings.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -I$(ROOT)/nro/include $< -o $@

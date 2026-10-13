@@ -42,6 +42,18 @@ typedef enum {
     // The Bluetooth page: the dedicated screen for driving the device directly
     // (docs/ble-poc.md). Its rows are the session the sysmodule reports and the
     // two numbers this side controls.
+    DglabString_BleEditMac,
+    DglabString_BleMacGuide,
+    DglabString_BleMacInvalid,
+    DglabString_BleMacSaved,
+    DglabString_BleMacSaveFailed,
+    DglabString_BleKeyboardFailed,
+    DglabString_BlePatchUnknown,
+    DglabString_BlePatchUnsupported,
+    DglabString_BlePatchMissing,
+    DglabString_BlePatchUnreadable,
+    DglabString_BlePatchInvalid,
+    DglabString_BlePatchFileOnly,
     DglabString_BleTitle,
     DglabString_DescBle,
     DglabString_BleState,

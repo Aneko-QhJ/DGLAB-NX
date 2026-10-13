@@ -883,6 +883,14 @@ static void motionSettingsLoad(DglabMotionFeedConfig* config);
 // The menu
 // ---------------------------------------------------------------------------
 
+static DglabBlePatchResult appBlePatchCheck(void)
+{
+    SetSysFirmwareVersion firmware = {0};
+    bool known = g_set_sys_ready && R_SUCCEEDED(setsysGetFirmwareVersion(&firmware));
+    return dglabBlePatchCheck("sdmc:/atmosphere/exefs_patches", known,
+        firmware.major, firmware.minor, firmware.micro);
+}
+
 // Kept across visits, so leaving a mode comes back to the same entry.
 static unsigned g_menu_selected = DglabMenu_ItemSocket;
 
@@ -919,7 +927,13 @@ static DglabMenuResult runMenuView(Service* dglab, PadState* pad)
 
         if (down & HidNpadButton_A) {
             switch (g_menu_selected) {
-                case DglabMenu_ItemBle: return DglabMenuResult_Ble;
+                case DglabMenu_ItemBle: {
+                    DglabBlePatchResult check = appBlePatchCheck();
+                    if (check == DglabBlePatch_Ok) return DglabMenuResult_Ble;
+                    state.ble_error = dglabBlePatchMessage(check);
+                    have_drawn = false;
+                    break;
+                }
                 case DglabMenu_ItemMotion: return DglabMenuResult_Motion;
                 case DglabMenu_ItemTouch: return DglabMenuResult_Touch;
                 case DglabMenu_ItemAdvanced: return DglabMenuResult_Advanced;
@@ -1162,33 +1176,44 @@ static void bleLogPoll(Service* dglab)
     }
 }
 
-// The address the sysmodule discovered and wrote out (docs/ble-poc.md,
-// "设备地址：自动发现"). Nothing to connect to without it, and the page says so
-// rather than guessing.
 static bool loadBleAddress(u8 out[6])
 {
-    FILE* file = fopen(BLE_ADDRESS_PATH, "r");
-    char line[64];
-    unsigned int bytes[6];
+    return dglabBleAddressLoad(BLE_ADDRESS_PATH, out);
+}
 
-    if (file == NULL)
-        return false;
+static SwkbdTextCheckResult bleKeyboardCheck(char* text, size_t size)
+{
+    u8 address[6];
+    if (dglabBleAddressParse(text, address)) return SwkbdTextCheckResult_OK;
+    snprintf(text, size, "%s", dglabString(DglabString_BleMacInvalid));
+    return SwkbdTextCheckResult_Bad;
+}
 
-    if (fgets(line, sizeof(line), file) == NULL) {
-        fclose(file);
-        return false;
-    }
-
-    fclose(file);
-
-    if (sscanf(line, "%x:%x:%x:%x:%x:%x", &bytes[0], &bytes[1], &bytes[2], &bytes[3],
-            &bytes[4], &bytes[5]) != 6)
-        return false;
-
-    for (int i = 0; i < 6; i++)
-        out[i] = (u8)bytes[i];
-
-    return true;
+static DglabBleEditResult bleEditAddress(u8 out[6])
+{
+    SwkbdConfig keyboard;
+    Result rc = swkbdCreate(&keyboard, 0);
+    if (R_FAILED(rc)) return DglabBleEdit_KeyboardFailed;
+    char initial[18] = "", text[256] = "";
+    u8 address[6];
+    if (loadBleAddress(address)) dglabBleAddressFormat(address, initial);
+    swkbdConfigMakePresetDefault(&keyboard);
+    swkbdConfigSetHeaderText(&keyboard, dglabString(DglabString_BleEditMac));
+    swkbdConfigSetGuideText(&keyboard, dglabString(DglabString_BleMacGuide));
+    swkbdConfigSetInitialText(&keyboard, initial);
+    swkbdConfigSetStringLenMax(&keyboard, 17);
+    swkbdConfigSetStringLenMin(&keyboard, 17);
+    swkbdConfigSetTextCheckCallback(&keyboard, bleKeyboardCheck);
+    rc = swkbdShow(&keyboard, text, sizeof(text));
+    swkbdClose(&keyboard);
+    // libnx uses BadExit for cancel as well as abnormal applet termination.
+    if (R_VALUE(rc) == MAKERESULT(Module_Libnx, LibnxError_LibAppletBadExit))
+        return DglabBleEdit_None;
+    if (R_FAILED(rc)) return DglabBleEdit_KeyboardFailed;
+    if (!dglabBleAddressParse(text, address)) return DglabBleEdit_Invalid;
+    if (!dglabBleAddressSave(BLE_ADDRESS_PATH, address)) return DglabBleEdit_SaveFailed;
+    memcpy(out, address, sizeof(address));
+    return DglabBleEdit_Saved;
 }
 
 static bool bleStateIsActive(u32 state)
@@ -1656,6 +1681,7 @@ int main(int argc, char* argv[])
         .about_state = nativeAboutState, .cycle_language = nativeCycleLanguage,
         .cycle_theme = nativeCycleTheme, .is_dark = nativeIsDark,
         .sysmodule_ok = appSysmoduleOk, .ble_active = appBleSessionActive,
+        .ble_check = appBlePatchCheck,
         .load_config = motionSettingsLoad, .save_config = motionSettingsSave,
         .poll = nativePoll, .log = nativeLog,
         .page_enter = appPageEnter, .page_update = appPageUpdate,

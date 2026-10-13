@@ -242,6 +242,7 @@ struct Gameplay::Impl {
     u32 logGeneration = 0;
     std::vector<brls::ActionIdentifier> hints;
     std::string startHint;
+    bool editHint = false;
 
     explicit Impl(DglabMenuResult kind) : page(kind) {
         body = new brls::Box(brls::Axis::COLUMN);
@@ -288,6 +289,8 @@ struct Gameplay::Impl {
             add(str(DglabString_BleState)); add(str(DglabString_BleDevice));
             add(std::string(str(DglabString_MotionVolume)) + " A");
             add(std::string(str(DglabString_MotionVolume)) + " B"); add(str(DglabString_BlePackets));
+            warning = text("", DGLAB_TEXT_NOTE); warning->setSingleLine(false); warning->setHeight(64);
+            details->addView(warning);
         } else {
             add(str(DglabString_MotionLink));
             add(str(page == DglabMenuResult_Motion ? DglabString_MotionJoyConLeft : DglabString_TouchHalfLeft));
@@ -313,9 +316,10 @@ struct Gameplay::Impl {
     void hint(DglabString key, brls::ControllerButton button, bool hidden = false) {
         hints.push_back(frame->registerAction(str(key), button, [](brls::View*) { return true; }, hidden));
     }
-    void updateHints(bool logs, bool running) {
+    void updateHints(bool logs, bool running, bool editable = false) {
         for (auto id : hints) frame->unregisterAction(id);
         hints.clear();
+        editHint = editable;
         hint(DglabString_ActionBack, brls::BUTTON_B);
         startHint = str(running ? DglabString_ActionStop : DglabString_ActionStart);
         if (logs) {
@@ -324,6 +328,7 @@ struct Gameplay::Impl {
             return;
         }
         if (page == DglabMenuResult_Socket || page == DglabMenuResult_Ble) hint(DglabString_ActionLog, brls::BUTTON_Y);
+        if (page == DglabMenuResult_Ble && editable) hint(DglabString_BleEditMac, brls::BUTTON_LB);
         if (page == DglabMenuResult_Motion) hint(DglabString_ActionRescan, brls::BUTTON_Y);
         hint(page == DglabMenuResult_Ble ? DglabString_ActionStop : DglabString_ActionClear, brls::BUTTON_X);
         hint(running ? DglabString_ActionStop : DglabString_ActionStart, brls::BUTTON_A);
@@ -331,7 +336,7 @@ struct Gameplay::Impl {
         brls::Application::getGlobalHintsUpdateEvent()->fire();
     }
     void update(const DglabGameplayState& state) {
-        bool live = false, logs = false, running = false;
+        bool live = false, logs = false, running = false, editable = false;
         const char* title = nullptr;
         if (page == DglabMenuResult_Socket) {
             const auto& s = state.value.socket;
@@ -364,8 +369,10 @@ struct Gameplay::Impl {
             rows[0]->set(str(key), s.status.state == DglabBleState_Failed ? DglabCmdTone_Error : DglabCmdTone_Ok);
             char address[32]; auto* a = s.status.address;
             std::snprintf(address, sizeof(address), "%02X:%02X:%02X:%02X:%02X:%02X", a[0], a[1], a[2], a[3], a[4], a[5]);
-            bool any = std::any_of(a, a + 6, [](u8 b) { return b != 0; });
-            rows[1]->set(any ? address : str(DglabString_BleDeviceNone));
+            rows[1]->set(s.address_valid ? address : str(DglabString_BleDeviceNone));
+            editable = !s.starting && s.status.state != DglabBleState_Connecting && s.status.state != DglabBleState_Connected;
+            setText(warning, dglabBleEditMessage(s.edit_result));
+            warning->setTextColor(toneColor(s.edit_result > DglabBleEdit_Saved ? DglabCmdTone_Error : DglabCmdTone_Warn));
             rows[2]->set(strength(s.strength_a, s.limit_a)); rows[3]->set(strength(s.strength_b, s.limit_b));
             rows[4]->set(std::to_string(s.status.packets));
         } else if (page == DglabMenuResult_Motion) {
@@ -396,7 +403,7 @@ struct Gameplay::Impl {
             if (docked->getVisibility() != visibility) docked->setVisibility(visibility);
         }
         setText(status, str(live ? DglabString_SysmoduleOk : DglabString_SysmoduleDown));
-        if (logs != logOpen || startHint != str(running ? DglabString_ActionStop : DglabString_ActionStart)) updateHints(logs, running);
+        if (logs != logOpen || editHint != editable || startHint != str(running ? DglabString_ActionStop : DglabString_ActionStart)) updateHints(logs, running, editable);
         bool changedLog = logs != logOpen;
         logOpen = logs;
         const char* nextTitle = logs ? state.log.title : title;
